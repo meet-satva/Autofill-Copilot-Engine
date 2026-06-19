@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Autofill API Test Form</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 24px; background: #f7f8fb; }
+    .container { max-width: 840px; margin: 0 auto; background: #fff; padding: 24px; border-radius: 12px; box-shadow: 0 16px 40px rgba(0,0,0,0.08); }
+    h1 { margin-bottom: 16px; }
+    label { display: block; margin-top: 16px; font-weight: 600; }
+    input, select, textarea { width: 100%; padding: 10px 12px; margin-top: 6px; border: 1px solid #cbd5e0; border-radius: 8px; font-size: 14px; }
+    input.autofilled, textarea.autofilled, select.autofilled { background: #fff9c4; }
+    button { margin-top: 20px; padding: 12px 18px; color: white; background: #2563eb; border: none; border-radius: 8px; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    pre { background: #f1f5f9; padding: 16px; border-radius: 10px; overflow-x: auto; margin-top: 20px; }
+    .inline-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Autofill Form</h1>
+
+    <label for="instruction">User Instruction</label>
+    <textarea id="instruction" rows="2" placeholder="Fill this form for Chintan">Fill this form for Chintan</textarea>
+
+    <div id="summary" style="margin-top: 12px; font-size: 14px;"></div>
+    <pre id="output">Awaiting results...</pre>
+
+    <div class="inline-row">
+      <div>
+        <label for="firstName">First name</label>
+        <input id="firstName" name="firstName" type="text" placeholder="First name" />
+      </div>
+      <div>
+        <label for="middleName">Middle name</label>
+        <input id="middleName" name="middleName" type="text" placeholder="Middle name" />
+      </div>
+    </div>
+
+    <div class="inline-row">
+      <div>
+        <label for="lastName">Last name</label>
+        <input id="lastName" name="lastName" type="text" placeholder="Last name" />
+      </div>
+      <div>
+        <label for="dob">Date of birth</label>
+        <input id="dob" name="dob" type="date" placeholder="Date of birth" />
+      </div>
+    </div>
+
+    <label for="aadhaarNumber">Aadhaar Number</label>
+    <input id="aadhaarNumber" name="aadhaarNumber" type="text" placeholder="Aadhaar Number" />
+
+
+    <label for="aadhaarLast4">Aadhaar last 4 digits</label>
+    <input id="aadhaarLast4" name="aadhaarLast4" type="text" placeholder="Aadhaar last 4 digits" />
+
+    <label for="panNumber">PAN number</label>
+    <input id="panNumber" name="panNumber" type="text" placeholder="PAN number" />
+
+    <label for="passport">Passport number</label>
+    <input id="passport" name="passport" type="text" placeholder="Passport number" />
+
+    <label for="address">Residential address</label>
+    <textarea id="address" name="address" rows="3" placeholder="Residential address"></textarea>
+
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" placeholder="Email address" />
+
+    <label for="phone">Phone number</label>
+    <input id="phone" name="phone" type="tel" placeholder="Phone number" />
+
+    <label for="wifeName">Wife name</label>
+    <input id="wifeName" name="wifeName" type="text" placeholder="Wife name" />
+
+    <label for="childName">Child name</label>
+    <input id="childName" name="childName" type="text" placeholder="Child name" />
+
+    <button id="testBtn" type="button">Run Autofill</button>
+  </div>
+
+  <script>
+    const testBtn = document.getElementById('testBtn');
+    const output = document.getElementById('output');
+    const summary = document.getElementById('summary');
+
+    function collectDomSchema() {
+      const fields = Array.from(document.querySelectorAll('input, textarea, select'));
+      return fields.map((field) => ({
+        id: field.id || null,
+        name: field.name || null,
+        labelText: document.querySelector(`label[for="${field.id}"]`)?.innerText || field.placeholder || '',
+        type: field.type || field.tagName.toLowerCase(),
+        tagName: field.tagName.toLowerCase(),
+        placeholder: field.placeholder || '',
+      }));
+    }
+
+    testBtn.addEventListener('click', async () => {
+      const userInstruction = document.getElementById('instruction').value;
+      const domSchema = collectDomSchema();
+
+      output.textContent = 'Calling backend...';
+
+      try {
+        const response = await fetch('http://localhost:3000/api/autofill/map/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userInstruction, domSchema }),
+        });
+
+        const data = await response.json();
+        output.textContent = JSON.stringify(data, null, 2);
+        if (summary) {
+          const total = data.summary?.total ?? 0;
+          const mapped = data.summary?.mapped ?? 0;
+          const unmapped = data.summary?.unmapped ?? 0;
+          summary.innerHTML = `Summary: <strong>${mapped} / ${total}</strong> auto-filled, <strong>${unmapped}</strong> not filled` +
+            (Array.isArray(data.unmappedFields) && data.unmappedFields.length ? `\nFields not filled: ${data.unmappedFields.map((f) => f.fieldLabel || f.fieldId || f.fieldName || 'unknown').join(', ')}` : '');
+        }
+
+        document.querySelectorAll('input, textarea, select').forEach((field) => field.classList.remove('autofilled'));
+        if (Array.isArray(data.mappings)) {
+          data.mappings.forEach((mapping) => {
+            if (!mapping.value) return;
+            const selector = mapping.fieldId ? `#${mapping.fieldId}` : mapping.fieldName ? `[name="${mapping.fieldName}"]` : null;
+            const field = selector ? document.querySelector(selector) : null;
+            if (!field) return;
+            if (field.type === 'date') {
+              const parsed = new Date(mapping.value);
+              if (!Number.isNaN(parsed.getTime())) {
+                field.value = parsed.toISOString().slice(0, 10);
+              } else {
+                field.value = mapping.value;
+              }
+            } else {
+              field.value = mapping.value;
+            }
+            field.classList.add('autofilled');
+          });
+        }
+      } catch (error) {
+        output.textContent = 'Request failed: ' + error.message;
+      }
+    });
+  </script>
+</body>
+</html>

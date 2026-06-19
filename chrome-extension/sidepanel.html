@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Identity Vault Copilot</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="header-logo">🔐 Identity Vault</div>
+      <div id="auth-status" class="auth-status"></div>
+    </header>
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen">
+      <h3>Sign in to your vault</h3>
+      <input type="email" id="login-email" placeholder="Email" />
+      <input type="password" id="login-password" placeholder="Password" />
+      <button id="btn-login" class="btn-primary">Sign In</button>
+      <button id="btn-signup" class="btn-ghost" type="button">Create Account</button>
+      <div id="login-error" class="error-msg"></div>
+    </div>
+
+    <!-- Main Chat Screen -->
+    <div id="main-screen" class="screen hidden">
+
+      <!-- Sync Vault Panel -->
+      <div class="sync-panel">
+        <button class="sync-toggle" id="btn-sync-toggle">
+          <span>⚡ Sync Vault</span>
+          <span class="sync-chevron" id="sync-chevron">▼</span>
+        </button>
+        <div class="sync-body hidden" id="sync-body">
+
+          <!-- Tab buttons -->
+          <div class="sync-tabs">
+            <button class="sync-tab active" id="tab-seed" data-tab="seed">✍️ Quick Seed</button>
+            <button class="sync-tab" id="tab-drive" data-tab="drive">📂 Google Drive</button>
+          </div>
+
+          <!-- Quick Seed Panel -->
+          <div id="panel-seed">
+            <p class="sync-hint">Paste your Aadhaar / identity data below and we'll populate your vault instantly.</p>
+            <textarea id="seed-data" class="sync-textarea" placeholder='Paste raw identity text (e.g. Aadhaar card text, any format)...' rows="5"></textarea>
+            <button id="btn-seed" class="btn-sync">Seed Vault ✓</button>
+            <div id="seed-status" class="sync-status-msg"></div>
+          </div>
+
+          <!-- Drive Sync Panel -->
+          <div id="panel-drive" class="hidden">
+            <p class="sync-hint">Paste your Google Drive folder URL to auto-scan all documents.</p>
+            <input
+              type="url"
+              id="sync-folder-url"
+              placeholder="https://drive.google.com/drive/folders/..."
+              class="sync-input"
+            />
+            <button id="btn-sync-drive" class="btn-sync">Sync from Drive</button>
+            <div id="sync-status" class="sync-status-msg"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="chat-history" class="chat-history"></div>
+
+      <div class="input-area">
+        <textarea
+          id="chat-input"
+          placeholder='e.g. "Fill this form for my wife Manisha and use our home address"'
+          rows="3"
+        ></textarea>
+        <div class="input-actions">
+          <button id="btn-send" class="btn-primary">Fill Form ↗</button>
+          <button id="btn-clear" class="btn-ghost">Clear</button>
+        </div>
+        <div id="autofill-loader" class="autofill-loader hidden">
+          <span class="loader-dot"></span>
+          <span id="autofill-loader-text">Autofill in progress…</span>
+        </div>
+      </div>
+
+      <div class="quick-prompts">
+        <span class="label">Quick:</span>
+        <button class="chip" data-prompt="Fill this form for Chintan">Chintan</button>
+        <button class="chip" data-prompt="Fill this form for my wife Manisha">Manisha</button>
+        <button class="chip" data-prompt="Fill this form for my daughter Dhyana">Dhyana</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

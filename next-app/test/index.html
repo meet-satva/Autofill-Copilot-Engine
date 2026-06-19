@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Identity Vault Autofill — BRD Acceptance Test Form</title>
+    <style>
+      :root {
+        --accent: #1565c0;
+        --section-bg: #f5f7fa;
+        --border: #d0d7de;
+        --expected: #e8f5e9;
+        --warn: #fff3e0;
+        --obfuscated: #fce4ec;
+        --highlight-expected: yellow;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        line-height: 1.5;
+        margin: 0;
+        color: #1f2328;
+        background: #fff;
+      }
+
+      header {
+        background: linear-gradient(135deg, #0d47a1, #1565c0);
+        color: #fff;
+        padding: 1.5rem 2rem;
+      }
+
+      header h1 {
+        margin: 0 0 0.25rem;
+        font-size: 1.5rem;
+      }
+
+      header p {
+        margin: 0;
+        opacity: 0.9;
+        max-width: 72ch;
+      }
+
+      .meta-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        padding: 0.75rem 2rem;
+        background: #e3f2fd;
+        border-bottom: 1px solid var(--border);
+        font-size: 0.875rem;
+      }
+
+      .meta-bar span {
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.2rem 0.75rem;
+      }
+
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 1.5rem 2rem 4rem;
+      }
+
+      details.test-guide {
+        background: var(--section-bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        margin-bottom: 2rem;
+        padding: 0.5rem 1rem 1rem;
+      }
+
+      details.test-guide summary {
+        cursor: pointer;
+        font-weight: 700;
+        font-size: 1.05rem;
+        padding: 0.5rem 0;
+      }
+
+      .guide-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1rem;
+        margin-top: 0.75rem;
+      }
+
+      .guide-card {
+        background: #fff;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+      }
+
+      .guide-card h3 {
+        margin: 0 0 0.5rem;
+        font-size: 0.95rem;
+        color: var(--accent);
+      }
+
+      .guide-card ul {
+        margin: 0;
+        padding-left: 1.1rem;
+      }
+
+      .guide-card li {
+        margin-bottom: 0.35rem;
+      }
+
+      .prompt-box {
+        background: #fffde7;
+        border-left: 4px solid #f9a825;
+        padding: 0.5rem 0.75rem;
+        margin: 0.35rem 0;
+        font-family: ui-monospace, Consolas, monospace;
+        font-size: 0.8rem;
+      }
+
+      section.form-section {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        margin-bottom: 1.75rem;
+        overflow: hidden;
+      }
+
+      section.form-section > header {
+        background: var(--section-bg);
+        color: inherit;
+        padding: 0.85rem 1.25rem;
+        border-bottom: 1px solid var(--border);
+      }
+
+      section.form-section > header h2 {
+        margin: 0;
+        font-size: 1.1rem;
+      }
+
+      section.form-section > header p {
+        margin: 0.35rem 0 0;
+        font-size: 0.85rem;
+        color: #57606a;
+        opacity: 1;
+      }
+
+      .section-body {
+        padding: 1.25rem;
+      }
+
+      fieldset {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin: 0 0 1.25rem;
+        padding: 1rem 1.25rem 1.25rem;
+      }
+
+      legend {
+        font-weight: 600;
+        padding: 0 0.35rem;
+      }
+
+      .field-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 1rem 1.25rem;
+        margin-bottom: 1rem;
+      }
+
+      .field-row:last-child {
+        margin-bottom: 0;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+      }
+
+      .field label,
+      .field .field-label {
+        font-size: 0.875rem;
+        font-weight: 500;
+      }
+
+      .field .hint {
+        font-size: 0.75rem;
+        color: #656d76;
+      }
+
+      .field .expected {
+        font-size: 0.72rem;
+        background: var(--expected);
+        border-radius: 4px;
+        padding: 0.15rem 0.4rem;
+        color: #2e7d32;
+      }
+
+      input[type="text"],
+      input[type="email"],
+      input[type="tel"],
+      input[type="date"],
+      input[type="number"],
+      input[type="password"],
+      textarea,
+      select {
+        width: 100%;
+        padding: 0.5rem 0.65rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font: inherit;
+        background: #fff;
+      }
+
+      input:focus,
+      textarea:focus,
+      select:focus {
+        outline: 2px solid #90caf9;
+        border-color: #1565c0;
+      }
+
+      textarea {
+        min-height: 80px;
+        resize: vertical;
+      }
+
+      .radio-group,
+      .checkbox-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem 1.25rem;
+      }
+
+      .radio-group label,
+      .checkbox-group label {
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-weight: 400;
+        font-size: 0.875rem;
+      }
+
+      table.form-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.875rem;
+      }
+
+      table.form-table th,
+      table.form-table td {
+        border: 1px solid var(--border);
+        padding: 0.5rem 0.65rem;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      table.form-table th {
+        background: var(--section-bg);
+        width: 35%;
+      }
+
+      .obfuscated-block {
+        background: var(--obfuscated);
+        border: 1px dashed #e91e63;
+        border-radius: 6px;
+        padding: 1rem;
+        margin-top: 1rem;
+      }
+
+      .obfuscated-block h3 {
+        margin: 0 0 0.5rem;
+        font-size: 0.95rem;
+        color: #c2185b;
+      }
+
+      .obfuscated-block p {
+        margin: 0 0 0.75rem;
+        font-size: 0.8rem;
+        color: #880e4f;
+      }
+
+      .framework-panel {
+        background: #f3e5f5;
+        border: 1px solid #ce93d8;
+        border-radius: 6px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+
+      .framework-panel h3 {
+        margin: 0 0 0.75rem;
+        font-size: 0.95rem;
+      }
+
+      .status-bar {
+        position: sticky;
+        bottom: 0;
+        background: #263238;
+        color: #eceff1;
+        padding: 0.75rem 2rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 0.875rem;
+        z-index: 10;
+      }
+
+      .status-bar button {
+        background: #4caf50;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 0.55rem 1.25rem;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .status-bar button:hover {
+        background: #43a047;
+      }
+
+      .status-bar .note {
+        opacity: 0.85;
+        max-width: 50ch;
+      }
+
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .span-label-field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.3rem;
+      }
+
+      .span-label-field > span:first-child {
+        font-size: 0.875rem;
+        font-weight: 500;
+      }
+
+      .scenario-tag {
+        display: inline-block;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        background: #e3f2fd;
+        color: #0d47a1;
+        border-radius: 4px;
+        padding: 0.1rem 0.4rem;
+        margin-left: 0.35rem;
+      }
+
+      .scenario-tag.edge {
+        background: var(--warn);
+        color: #e65100;
+      }
+
+      .scenario-tag.fail {
+        background: var(--obfuscated);
+        color: #c2185b;
+      }
+
+      #fill-count {
+        font-family: ui-monospace, Consolas, monospace;
+      }
+    </style>
+  </head>
+  <body>
+  
+
+    
+
+    <main>
+      
+
+        
+
+      <form id="acceptance-form" novalidate autocomplete="off" onsubmit="return handleSubmit(event)">
+        <!-- SECTION 1: Applicant personal details -->
+        <section class="form-section" id="section-applicant">
+          <header>
+            <h2>
+              1. Applicant Personal Details
+              <span class="scenario-tag">F-04.2</span>
+            </h2>
+            <p>Standard label-for associations, name/id attributes, mixed field types.</p>
+          </header>
+          <div class="section-body">
+            <fieldset>
+              <legend>Primary applicant</legend>
+              <div class="field-row">
+                <div class="field">
+                  <label for="applicant-first-name">First Name</label>
+                  <input type="text" id="applicant-first-name" name="applicantFirstName" />
+                  <span class="expected">Manisha → Manisha | Chintan → Chintan</span>
+                </div>
+                <div class="field">
+                  <label for="applicant-middle-name">Middle Name</label>
+                  <input type="text" id="applicant-middle-name" name="applicantMiddleName" />
+                  <span class="expected">Chintan → Jayantibhai</span>
+                </div>
+                <div class="field">
+                  <label for="applicant-last-name">Last Name / Surname</label>
+                  <input type="text" id="applicant-last-name" name="applicantLastName" />
+                  <span class="expected">→ Prajapati</span>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="applicant-full-name">Full Legal Name (as per ID)</label>
+                  <input
+                    type="text"
+                    id="applicant-full-name"
+                    name="applicantFullName"
+                    placeholder="Enter full name exactly as on government ID"
+                  />
+                  <span class="expected">Chintan → Chintan Jayantibhai Prajapati</span>
+                </div>
+                <div class="field">
+                  <label for="applicant-dob">Date of Birth</label>
+                  <input type="date" id="applicant-dob" name="applicantDob" />
+                  <span class="expected">Chintan → 1990-01-01 | Manisha → 1992-05-20</span>
+                </div>
+                <div class="field">
+                  <label for="applicant-email">Email Address</label>
+                  <input type="email" id="applicant-email" name="applicantEmail" />
+                  <span class="hint">No vault value — should remain empty or warn</span>
+                </div>
+              </div>
+            </fieldset>
+          </div>
+        </section>
+
+        <!-- SECTION 2: Government identity -->
+        <section class="form-section" id="section-identity">
+          <header>
+            <h2>
+              2. Government Identity Documents
+              <span class="scenario-tag">F-03 / F-04.2</span>
+            </h2>
+            <p>Aadhaar, PAN, and UID fields with varied labeling patterns.</p>
+          </header>
+          <div class="section-body">
+            <div class="field-row">
+              <div class="field">
+                <label for="aadhaar-number">Aadhaar Number (12 digits)</label>
+                <input
+                  type="text"
+                  id="aadhaar-number"
+                  name="aadhaarNumber"
+                  inputmode="numeric"
+                  maxlength="14"
+                />
+                <span class="expected">Manisha → XXXX-XXXX-2222</span>
+              </div>
+              <div class="field">
+                <label for="uidai-number">UID / Unique Identification Number</label>
+                <input type="text" id="uidai-number" name="uidaiNumber" />
+                <span class="hint">Alias label for Aadhaar — same vault field</span>
+              </div>
+              <div class="field">
+                <label for="pan-number">PAN Card Number</label>
+                <input type="text" id="pan-number" name="panNumber" />
+                <span class="hint">Not in sample vault — expect skip or partial warning</span>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="id-issue-date">ID Issue Date</label>
+                <input type="date" id="id-issue-date" name="idIssueDate" />
+                <span class="expected">→ determinedDate from vault (e.g. 2024-05-12)</span>
+              </div>
+              <div class="field">
+                <label for="national-id">National ID Number</label>
+                <input type="text" id="national-id" name="nationalId" aria-label="National identity document number" />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 3: Address -->
+        <section class="form-section" id="section-address">
+          <header>
+            <h2>
+              3. Address &amp; Correspondence
+              <span class="scenario-tag">F-04.2 Asset routing</span>
+            </h2>
+            <p>Personal Aadhaar address vs residential property asset location.</p>
+          </header>
+          <div class="section-body">
+            <div class="field-row">
+              <div class="field">
+                <label for="current-address">Current Residential Address</label>
+                <textarea id="current-address" name="currentAddress"></textarea>
+                <span class="expected">Asset prompt → Thaltej, Ahmedabad, Gujarat</span>
+              </div>
+              <div class="field">
+                <label for="correspondence-address">Correspondence / Mailing Address</label>
+                <textarea id="correspondence-address" name="correspondenceAddress"></textarea>
+                <span class="expected">Identity → Ahmedabad, Gujarat, India</span>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="city">City</label>
+                <input type="text" id="city" name="city" />
+              </div>
+              <div class="field">
+                <label for="state">State / Province</label>
+                <input type="text" id="state" name="state" />
+              </div>
+              <div class="field">
+                <label for="pincode">PIN / ZIP Code</label>
+                <input type="text" id="pincode" name="pincode" inputmode="numeric" />
+                <span class="hint">Not in vault — manual or partial fill</span>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="permanent-address-line1">Permanent Address Line 1</label>
+                <input type="text" id="permanent-address-line1" name="permanentAddressLine1" />
+              </div>
+              <div class="field">
+                <label for="permanent-address-line2">Permanent Address Line 2</label>
+                <input type="text" id="permanent-address-line2" name="permanentAddressLine2" />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 4: Family relationships -->
+        <section class="form-section" id="section-family">
+          <header>
+            <h2>
+              4. Family &amp; Relationship Fields
+              <span class="scenario-tag">BRD §2 Relational Logic</span>
+            </h2>
+            <p>Spouse, husband, wife, mother, child, emergency contact — cross-profile routing.</p>
+          </header>
+          <div class="section-body">
+            <fieldset>
+              <legend>Family members</legend>
+              <div class="field-row">
+                <div class="field">
+                  <label for="spouse-name">Spouse Name</label>
+                  <input type="text" id="spouse-name" name="spouseName" />
+                  <span class="expected">Manisha applicant → Chintan | Chintan → Manisha</span>
+                </div>
+                <div class="field">
+                  <label for="husband-name">Husband's Full Name</label>
+                  <input type="text" id="husband-name" name="husbandName" />
+                  <span class="expected">Manisha applicant → Chintan Jayantibhai Prajapati</span>
+                </div>
+                <div class="field">
+                  <label for="wife-name">Wife's Full Name</label>
+                  <input type="text" id="wife-name" name="wifeName" />
+                  <span class="expected">Chintan applicant → Manisha Prajapati</span>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="mother-name">Mother's Name</label>
+                  <input type="text" id="mother-name" name="motherName" />
+                  <span class="expected">→ Geetaben</span>
+                </div>
+                <div class="field">
+                  <label for="father-name">Father's Name</label>
+                  <input type="text" id="father-name" name="fatherName" />
+                  <span class="hint">Not in vault familyTree — expect empty or warning</span>
+                </div>
+                <div class="field">
+                  <label for="child-name">Child / Dependent Name</label>
+                  <input type="text" id="child-name" name="childName" />
+                  <span class="expected">→ Dhyana Prajapati</span>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Emergency contact</legend>
+              <div class="field-row">
+                <div class="field">
+                  <label for="emergency-contact-name">Emergency Contact Name</label>
+                  <input type="text" id="emergency-contact-name" name="emergencyContactName" />
+                  <span class="expected">Manisha form → Chintan | Chintan form → Manisha</span>
+                </div>
+                <div class="field">
+                  <label for="emergency-contact-phone">Emergency Contact Phone</label>
+                  <input type="tel" id="emergency-contact-phone" name="emergencyContactPhone" />
+                  <span class="hint">Not in vault</span>
+                </div>
+                <div class="field">
+                  <label for="emergency-contact-relation">Relationship to Applicant</label>
+                  <select id="emergency-contact-relation" name="emergencyContactRelation">
+                    <option value="">— Select —</option>
+                    <option value="spouse">Spouse</option>
+                    <option value="parent">Parent</option>
+                    <option value="child">Child</option>
+                    <option value="sibling">Sibling</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+              </div>
+            </fieldset>
+          </div>
+        </section>
+
+        <!-- SECTION 5: Property / assets -->
+        <section class="form-section" id="section-assets">
+          <header>
+            <h2>
+              5. Property &amp; Asset Registration
+              <span class="scenario-tag">F-03 assets</span>
+            </h2>
+            <p>Land, home, and registry fields from vault assets map.</p>
+          </header>
+          <div class="section-body">
+            <div class="field-row">
+              <div class="field">
+                <label for="property-type">Property Type</label>
+                <select id="property-type" name="propertyType">
+                  <option value="">— Select property type —</option>
+                  <option value="residential">Residential Home</option>
+                  <option value="commercial">Commercial / Office</option>
+                  <option value="agricultural">Agricultural Land</option>
+                  <option value="industrial">Industrial</option>
+                </select>
+                <span class="expected">→ Residential Home</span>
+              </div>
+              <div class="field">
+                <label for="property-location">Property Location / Address</label>
+                <input type="text" id="property-location" name="propertyLocation" />
+                <span class="expected">→ Thaltej, Ahmedabad, Gujarat</span>
+              </div>
+              <div class="field">
+                <label for="registration-number">Registration / Index Number</label>
+                <input type="text" id="registration-number" name="registrationNumber" />
+                <span class="expected">→ REG-INDEX2-99821</span>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="property-owner-1">Property Owner 1</label>
+                <input type="text" id="property-owner-1" name="propertyOwner1" />
+                <span class="expected">→ Chintan Jayantibhai Prajapati</span>
+              </div>
+              <div class="field">
+                <label for="property-owner-2">Property Owner 2 (Co-owner)</label>
+                <input type="text" id="property-owner-2" name="propertyOwner2" />
+                <span class="expected">→ Manisha Prajapati</span>
+              </div>
+              <div class="field">
+                <label for="index2-reference">Index-II Document Reference</label>
+                <input type="text" id="index2-reference" name="index2Reference" />
+                <span class="hint">associatedDocuments.index_2_id in vault</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 6: Alternative DOM patterns -->
+        <section class="form-section" id="section-dom-patterns">
+          <header>
+            <h2>
+              6. Alternative DOM Label Patterns
+              <span class="scenario-tag">F-04.2 DOM Scraping</span>
+            </h2>
+            <p>ARIA, span labels, table layout, placeholder-only, and visually hidden labels.</p>
+          </header>
+          <div class="section-body">
+            <div class="field-row">
+              <div class="field">
+                <input
+                  type="text"
+                  id="aria-labelled-fullname"
+                  name="ariaFullName"
+                  aria-label="Full name as per government records"
+                />
+                <span class="hint">aria-label only (no visible label)</span>
+                <span class="expected">→ Full name from active profile</span>
+              </div>
+              <div class="field">
+                <span id="lbl-dob-aria" class="field-label">Birth Date (aria-labelledby)</span>
+                <input
+                  type="date"
+                  id="aria-labelledby-dob"
+                  name="ariaDob"
+                  aria-labelledby="lbl-dob-aria"
+                />
+              </div>
+            </div>
+
+            <div class="field-row">
+              <div class="span-label-field">
+                <span>Nationality (span label, no &lt;label&gt;)</span>
+                <input type="text" id="span-label-nationality" name="nationality" />
+                <span class="hint">Common in legacy portals</span>
+              </div>
+              <div class="field">
+                <label for="placeholder-only-mobile" class="visually-hidden">Mobile Number</label>
+                <input
+                  type="tel"
+                  id="placeholder-only-mobile"
+                  name="mobileNumber"
+                  placeholder="Mobile Number (10 digits)"
+                />
+                <span class="hint">Placeholder as only hint</span>
+              </div>
+            </div>
+
+            <table class="form-table" role="presentation">
+              <caption style="text-align: left; font-weight: 600; margin-bottom: 0.5rem">
+                Table-layout fields (government portal style)
+              </caption>
+              <tbody>
+                <tr>
+                  <th scope="row">
+                    <label for="table-applicant-name">Applicant Name</label>
+                  </th>
+                  <td>
+                    <input type="text" id="table-applicant-name" name="tableApplicantName" />
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row">
+                    <label for="table-aadhaar">Aadhaar No.</label>
+                  </th>
+                  <td>
+                    <input type="text" id="table-aadhaar" name="tableAadhaar" />
+                  </td>
+                </tr>
+                <tr>
+                  <th scope="row">
+                    <label for="table-property-addr">Registered Property Address</label>
+                  </th>
+                  <td>
+                    <input type="text" id="table-property-addr" name="tablePropertyAddress" />
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      
+       
+        <!-- SECTION 9: Edge cases -->
+        <section class="form-section" id="section-edge">
+          <header>
+            <h2>
+              7. Edge Cases &amp; Guard Rails
+              <span class="scenario-tag edge">Edge</span>
+            </h2>
+            <p>Hidden, disabled, readonly, pre-filled, password, radio, checkbox, number.</p>
+          </header>
+          <div class="section-body">
+            <div class="field-row">
+              <div class="field">
+                <label for="prefilled-readonly">Pre-filled Readonly Field</label>
+                <input
+                  type="text"
+                  id="prefilled-readonly"
+                  name="prefilledReadonly"
+                  value="GOV-REF-2026-LOCKED"
+                  readonly
+                />
+                <span class="hint">Must NOT overwrite readonly</span>
+              </div>
+              <div class="field">
+                <label for="disabled-field">Disabled Field</label>
+                <input
+                  type="text"
+                  id="disabled-field"
+                  name="disabledField"
+                  value=""
+                  disabled
+                  placeholder="Should remain empty"
+                />
+                <span class="hint">Must skip disabled</span>
+              </div>
+              <div class="field">
+                <label for="hidden-tracking">Hidden tracking token</label>
+                <input type="hidden" id="hidden-tracking" name="trackingToken" value="csrf_abc123" />
+                <span class="hint">Hidden input — must never receive vault PII</span>
+              </div>
+            </div>
+
+            <fieldset>
+              <legend>Gender (radio group)</legend>
+              <div class="radio-group" role="radiogroup" aria-label="Gender">
+                <label><input type="radio" name="gender" value="male" /> Male</label>
+                <label><input type="radio" name="gender" value="female" /> Female</label>
+                <label><input type="radio" name="gender" value="other" /> Other / Prefer not to say</label>
+              </div>
+              <span class="hint">Not in vault — should not auto-select unless inferred</span>
+            </fieldset>
+
+            <fieldset>
+              <legend>Declarations (checkbox group)</legend>
+              <div class="checkbox-group">
+                <label>
+                  <input type="checkbox" name="declareAccuracy" value="yes" />
+                  I declare the information provided is accurate
+                </label>
+                <label>
+                  <input type="checkbox" name="declareConsent" value="yes" />
+                  I consent to identity verification
+                </label>
+              </div>
+              <span class="hint">Extension must NOT auto-check legal declarations (out of scope)</span>
+            </fieldset>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="annual-income">Annual Income (INR)</label>
+                <input type="number" id="annual-income" name="annualIncome" min="0" step="1000" />
+              </div>
+              <div class="field">
+                <label for="account-password">Create Portal Password</label>
+                <input type="password" id="account-password" name="accountPassword" />
+                <span class="hint">Never fill passwords from vault</span>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="additional-notes">Additional Notes / Remarks</label>
+              <textarea id="additional-notes" name="additionalNotes" rows="3"></textarea>
+              <span class="hint">Free text — no vault mapping expected</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- SECTION 10: Multi-step simulation -->
+        <section class="form-section" id="section-multistep">
+          <header>
+            <h2>
+              8. Multi-step Form Simulation
+              <span class="scenario-tag">F-04.2</span>
+            </h2>
+            <p>Second "step" visible on same page — tests section-scoped filling.</p>
+          </header>
+          <div class="section-body">
+            <fieldset id="step-2-panel">
+              <legend>Step 2 — Verification details (expand after Step 1)</legend>
+              <div class="field-row">
+                <div class="field">
+                  <label for="verify-applicant">Verified Applicant Name</label>
+                  <input type="text" id="verify-applicant" name="verifyApplicant" />
+                </div>
+                <div class="field">
+                  <label for="verify-aadhaar-last4">Aadhaar Last 4 Digits</label>
+                  <input
+                    type="text"
+                    id="verify-aadhaar-last4"
+                    name="verifyAadhaarLast4"
+                    maxlength="4"
+                  />
+                  <span class="expected">Manisha → 2222 | Chintan → 1111</span>
+                </div>
+                <div class="field">
+                  <label for="verify-property-reg">Verify Property Registration No.</label>
+                  <input type="text" id="verify-property-reg" name="verifyPropertyReg" />
+                  <span class="expected">→ REG-INDEX2-99821</span>
+                </div>
+              </div>
+            </fieldset>
+          </div>
+        </section>
+      </form>
+    </main>
+
+   
+
+    <script>
+      (function () {
+        const HIGHLIGHT_COLOR = "yellow";
+
+        function bindFrameworkSim(inputId, displayId, events) {
+          const input = document.getElementById(inputId);
+          const display = document.getElementById(displayId);
+          if (!input || !display) return;
+
+          const sync = function () {
+            display.textContent = input.value || "(empty)";
+          };
+
+          ["input", "change", "blur"].forEach(function (evt) {
+            input.addEventListener(evt, sync);
+          });
+          sync();
+        }
+
+        bindFrameworkSim("react-controlled-name", "react-display");
+        bindFrameworkSim("angular-ng-model-address", "angular-display");
+        bindFrameworkSim("vue-v-model-spouse", "vue-display");
+
+        function countFilledFields() {
+          const form = document.getElementById("acceptance-form");
+          const selectors = "input:not([type=hidden]):not([type=radio]):not([type=checkbox]), textarea, select";
+          let count = 0;
+
+          form.querySelectorAll(selectors).forEach(function (el) {
+            if (el.disabled || el.readOnly) return;
+            if (el.type === "radio" || el.type === "checkbox") return;
+            const val = (el.value || "").trim();
+            if (val) count += 1;
+          });
+
+          form.querySelectorAll('input[type="radio"]:checked').forEach(function () {
+            count += 1;
+          });
+          form.querySelectorAll('input[type="checkbox"]:checked').forEach(function () {
+            count += 1;
+          });
+
+          document.getElementById("fill-count").textContent = "Filled fields: " + count;
+        }
+
+        document.getElementById("acceptance-form").addEventListener("input", countFilledFields);
+        document.getElementById("acceptance-form").addEventListener("change", countFilledFields);
+
+        window.handleSubmit = function (event) {
+          if (event) event.preventDefault();
+          const filled = document.getElementById("fill-count").textContent;
+          alert(
+            "Form NOT auto-submitted by extension (BRD §3.2).\n\n" +
+              filled +
+              "\n\nReview all highlighted fields before real submission."
+          );
+          return false;
+        };
+
+        document.getElementById("btn-reset").addEventListener("click", function () {
+          const form = document.getElementById("acceptance-form");
+          form.reset();
+          document.querySelectorAll("input, textarea, select").forEach(function (el) {
+            el.style.backgroundColor = "";
+          });
+          ["react-display", "angular-display", "vue-display"].forEach(function (id) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = "(empty)";
+          });
+          countFilledFields();
+        });
+
+        window.__acceptanceTestForm = {
+          version: "1.0",
+          expectedHighlight: HIGHLIGHT_COLOR,
+          obfuscatedFieldIds: ["x_991_abc", "field_7b3", "q8f2k9m1", "dyn_input_0042"],
+          skipFieldIds: ["hidden-tracking", "disabled-field", "prefilled-readonly"],
+          countFilledFields: countFilledFields,
+        };
+
+        countFilledFields();
+      })();
+    </script>
+  </body>
+</html>
