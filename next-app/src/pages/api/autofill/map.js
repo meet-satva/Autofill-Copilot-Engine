@@ -16,6 +16,7 @@ function getOpenAIClient() {
 }
 
 const MAP_MODEL = 'meta/llama-3.1-70b-instruct';
+const MODEL_TIMEOUT_MS = 30000;
 
 const AUTOFILL_SYSTEM_PROMPT = `You are an intelligent form autofill engine for a personal identity vault.
 You receive:
@@ -140,13 +141,21 @@ Return the field mapping JSON array now.`;
     const openaiClient = getOpenAIClient();
     let response = null;
     if (needsModel && openaiClient) {
-      response = await openaiClient.chat.completions.create({
+      const modelRequest = openaiClient.chat.completions.create({
         model: MAP_MODEL,
         max_tokens: 2000,
         messages: [
           { role: 'system', content: AUTOFILL_SYSTEM_PROMPT },
           { role: 'user', content: userMessage },
         ],
+      });
+      response = await withTimeout(
+        modelRequest,
+        MODEL_TIMEOUT_MS,
+        `Mapping model timed out after ${MODEL_TIMEOUT_MS / 1000} seconds`
+      ).catch((err) => {
+        console.warn('Mapping model unavailable, falling back to heuristics:', err.message);
+        return null;
       });
     }
 
@@ -169,10 +178,7 @@ Return the field mapping JSON array now.`;
     }
 
     if (needsModel && !clean) {
-      return res.status(502).json({
-        error: 'Mapping model returned an empty response',
-        detail: `Model ${MAP_MODEL} returned no text.`,
-      });
+      console.warn('Mapping model returned no text, falling back to heuristics.');
     }
 
     if (needsModel) {
@@ -259,8 +265,29 @@ Return the field mapping JSON array now.`;
     });
   } catch (err) {
     console.error('Autofill mapping failed:', err);
-    return res.status(500).json({ error: 'Mapping failed', detail: err.message, model: MAP_MODEL });
+    return res.status(200).json({
+      mappings: autoMappings,
+      unmappedFields: autoMappings.filter(
+        (m) => m.confidence === 'low' || (m.value === null && !m.fileUrl)
+      ),
+      summary: {
+        total: autoMappings.length,
+        mapped: autoMappings.filter((m) => m.confidence !== 'low' && (m.value !== null || m.fileUrl)).length,
+        unmapped: autoMappings.filter((m) => m.confidence === 'low' || (m.value === null && !m.fileUrl)).length,
+      },
+      warning: err.message,
+      model: MAP_MODEL,
+    });
   }
+}
+
+function withTimeout(promise, ms, errorMessage) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(errorMessage)), ms);
+    }),
+  ]);
 }
 
 /**
@@ -411,6 +438,66 @@ function extractLastDigits(value, count) {
   return digits.slice(-count);
 }
 
+function collectDocumentValues(profile, vault, applicantProfileKey) {
+  const values = {};
+  const profilesToCheck = [];
+  if (profile) profilesToCheck.push(profile);
+  if (vault?.profiles) {
+    if (applicantProfileKey && vault.profiles[applicantProfileKey] && vault.profiles[applicantProfileKey] !== profile) {
+      profilesToCheck.push(vault.profiles[applicantProfileKey]);
+    }
+    for (const [key, item] of Object.entries(vault.profiles)) {
+      if (item && item !== profile && key !== applicantProfileKey) profilesToCheck.push(item);
+    }
+  }
+
+  const assignIfMissing = (key, value) => {
+    if ((value === null || value === undefined || value === '') || values[key]) return;
+    values[key] = value;
+  };
+
+  for (const prof of profilesToCheck) {
+    const pd = prof.personalDetails || {};
+    const identities = prof.identities || {};
+    const documents = prof.documents || [];
+
+    assignIfMissing('aadhaar', identities.aadhaar?.aadhaarNumber || identities.aadhaar?.idNumber || pd.aadhaarNumber || pd.idNumber);
+    assignIfMissing('pan', identities.pan?.panNumber || identities.pan?.idNumber || pd.panNumber || pd.idNumber);
+    assignIfMissing('pincode', identities.aadhaar?.pincode || identities.pan?.pincode || pd.pincode);
+
+    for (const doc of Object.values(identities)) {
+      assignIfMissing('aadhaar', doc.aadhaarNumber || doc.idNumber || doc.documentNumber);
+      assignIfMissing('pan', doc.panNumber || doc.idNumber || doc.documentNumber);
+      assignIfMissing('pincode', doc.pincode);
+    }
+
+    for (const doc of documents) {
+      const blob = normalize([
+        doc.documentType,
+        doc.name,
+        doc.otherDetails?.title,
+        doc.otherDetails?.label,
+        doc.otherDetails?.description,
+        doc.fileName,
+      ].filter(Boolean).join(' '));
+
+      if (blob.includes('pan')) {
+        assignIfMissing('pan', doc.panNumber || doc.idNumber || doc.documentNumber);
+      }
+      if (blob.includes('aadhaar') || blob.includes('aadhar') || blob.includes('uid')) {
+        assignIfMissing('aadhaar', doc.aadhaarNumber || doc.idNumber || doc.documentNumber);
+      }
+      if (blob.includes('national id') || blob.includes('government id')) {
+        assignIfMissing('aadhaar', doc.aadhaarNumber || doc.idNumber || doc.documentNumber);
+        assignIfMissing('pan', doc.panNumber || doc.idNumber || doc.documentNumber);
+      }
+      assignIfMissing('pincode', doc.pincode);
+    }
+  }
+
+  return values;
+}
+
 function inferCommonField(field, vault, userInstruction) {
   const label = normalizeFieldText(field);
   const applicantProfileKey = getApplicantProfileKey(vault, userInstruction);
@@ -419,6 +506,7 @@ function inferCommonField(field, vault, userInstruction) {
   const familyTree = vault.familyTree || {};
   const pd = profile.personalDetails || {};
   const idDoc = profile.identities?.aadhaar || {};
+  const documentLookup = collectDocumentValues(profile, vault, applicantProfileKey);
   
   const fullName = pd.fullName || pd.name || [pd.firstName, pd.middleName, pd.lastName].filter(Boolean).join(' ') || '';
   const { firstName, middleName, lastName } = splitNameParts(fullName);
@@ -437,10 +525,11 @@ function inferCommonField(field, vault, userInstruction) {
   const dob = pd.dob || idDoc.dob || null;
   const rawGender = (pd.gender || idDoc.gender || '').toLowerCase();
   const gender = rawGender.includes('female') ? 'female' : rawGender.includes('male') ? 'male' : rawGender;
-  const aadhaarNumber = idDoc.aadhaarNumber || idDoc.idNumber || pd.aadhaarNumber || pd.idNumber || null;
-  const nationalId = idDoc.idNumber || idDoc.aadhaarNumber || pd.idNumber || pd.aadhaarNumber || null;
+  const aadhaarNumber = documentLookup.aadhaar || idDoc.aadhaarNumber || idDoc.idNumber || pd.aadhaarNumber || pd.idNumber || null;
+  const panNumber = documentLookup.pan || idDoc.panNumber || pd.panNumber || null;
+  const nationalId = idDoc.idNumber || idDoc.aadhaarNumber || pd.idNumber || pd.aadhaarNumber || panNumber || null;
   const address = idDoc.address || pd.address || null;
-  let pincode = idDoc.pincode || pd.pincode || null;
+  let pincode = documentLookup.pincode || idDoc.pincode || pd.pincode || null;
   
  
   if (!pincode && address) {
@@ -482,8 +571,9 @@ function inferCommonField(field, vault, userInstruction) {
   if (lastDigitsAadhaar) return lastDigitsAadhaar;
   if (/last 4|last4|last-four|last four/.test(label)) return aadhaarNumber ? aadhaarNumber.toString().replace(/\D/g, '').slice(-4) : null;
 
-  if (/aadhaar|aadhar|uidai|unique identification|uid\b/.test(label)) return aadhaarNumber || nationalId || null;
-  if (/national id|identity number|id number/.test(label)) return nationalId || aadhaarNumber || null;
+  if (/aadhaar|aadhar|adhar|uidai|unique identification|uid\b/.test(label)) return aadhaarNumber || nationalId || null;
+  if (/pan|permanent account|income tax|tax id|tax identification/.test(label)) return panNumber || nationalId || null;
+  if (/national id|identity number|id number|government id|govt id|document number/.test(label)) return nationalId || aadhaarNumber || panNumber || null;
 
   if (/birth date|date of birth|dob|birthday/.test(label) || /dob|date/.test(rawFieldText)) return dob || null;
 
@@ -495,24 +585,24 @@ function inferCommonField(field, vault, userInstruction) {
   if (/city\b/.test(label)) return city || null;
   if (/state|province|region/.test(label)) return state || null;
   if (/pin\s*\/\s*zip|zip\s*\/\s*pin|pin|zip|postal code/.test(label)) {
-  if (pincode) return pincode.toString().replace(/\D/g, '');
-  return null;
-}
-if (/emergency\s*contact\s*name|emergency\s*contact\b/.test(label) && !/phone|mobile|relation/.test(label)) {
-  return emergencyContact;
-}
+    if (pincode) return pincode.toString().replace(/\D/g, '');
+    return null;
+  }
+  if (/emergency\s*contact\s*name|emergency\s*contact\b/.test(label) && !/phone|mobile|relation/.test(label)) {
+    return emergencyContact;
+  }
 
-if (/emergency\s*contact\s*phone|emergency\s*contact\s*mobile/.test(label)) {
-  return phone || null;
-}
+  if (/emergency\s*contact\s*phone|emergency\s*contact\s*mobile/.test(label)) {
+    return phone || null;
+  }
 
-if (/emergency\s*contact\s*relation|relationship\s*to\s*applicant/.test(label)) {
-  return spouseName ? 'Spouse' : motherName ? 'Mother' : null;
-}
+  if (/emergency\s*contact\s*relation|relationship\s*to\s*applicant/.test(label)) {
+    return spouseName ? 'Spouse' : motherName ? 'Mother' : null;
+  }
 
-if (/emergency\s*contact\s*member|emergency\s*member/.test(label)) {
-  return emergencyContact;
-}
+  if (/emergency\s*contact\s*member|emergency\s*member/.test(label)) {
+    return emergencyContact;
+  }
   // Nationality
   if (/nationality/.test(label)) return address && address.toLowerCase().includes('india') ? 'Indian' : null;
 
@@ -614,7 +704,7 @@ function inferDocumentKey(field) {
   const label = normalizeFieldText(field);
   if (!label) return null;
   if (/aadhaar|aadhar|uidai|unique identification|uid\b/.test(label)) return 'aadhaar';
-  if (/\bpan\b|pan card|income tax|tax id|taxpayer/.test(label)) return 'pan';
+  if (/\bpan\b|pan card|income tax|tax id|taxpayer |panNumber|pan number/.test(label)) return 'pan';
   if (/passport/.test(label)) return 'passport';
   if (/voter|election card|epic/.test(label)) return 'voterCard';
   if (/driving|licence|license|dl/.test(label)) return 'drivingLicense';

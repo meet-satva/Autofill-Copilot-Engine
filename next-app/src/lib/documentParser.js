@@ -168,6 +168,30 @@ async function extractPdfText(pdfBuffer) {
   }
 }
 
+function shouldFallbackToImageOcr(text, documentType = '', fileName = '') {
+  const normalized = (text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return true;
+  if (normalized.length < 40) return true;
+
+  const doc = `${documentType} ${fileName}`.toLowerCase();
+
+  if (doc.includes('pan')) {
+    return !(
+      /permanent account number|income tax|government of india|date of birth|[A-Z]{5}[0-9]{4}[A-Z]/i.test(normalized)
+    );
+  }
+
+  if (doc.includes('aadhaar') || doc.includes('aadhar')) {
+    return !(/aadhaar|aadhar|uidai|male|female|\b\d{4}\s?\d{4}\s?\d{4}\b/i.test(normalized));
+  }
+
+  if (doc.includes('passport')) {
+    return !(/passport|nationality|date of issue|date of expiry/i.test(normalized));
+  }
+
+  return /^[\W_]*$/.test(normalized) || !/[0-9]/.test(normalized) && normalized.split(' ').length <= 4;
+}
+
 async function renderPdfPagesAsImages(pdfBuffer, maxPages = 2) {
   try {
     const metadata = await sharp(pdfBuffer, { density: 300 }).metadata();
@@ -265,10 +289,14 @@ export async function parseDocumentGroup(group) {
           console.log(`    📄 PDF: ${file.name}`);
           const pdfBuffer = Buffer.from(fetched.base64, 'base64');
           const text = await extractPdfText(pdfBuffer);
-          if (text) {
+          const useImageFallback = shouldFallbackToImageOcr(text, documentType, file.name);
+          if (text && !useImageFallback) {
             textParts.push(`[${file.name}]:\n${text}`);
           } else {
-            console.log(`    🔄 PDF text empty or scanned; rendering pages as images`);
+            console.log(`    🔄 PDF text is low-confidence or scanned; rendering pages as images`);
+            if (text) {
+              textParts.push(`[${file.name}] OCR text:\n${text}`);
+            }
             const pageImages = await renderPdfPagesAsImages(pdfBuffer);
             pageImages.forEach((buffer, index) => {
               imageFiles.push({
