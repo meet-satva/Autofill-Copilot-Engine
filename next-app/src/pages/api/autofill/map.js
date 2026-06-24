@@ -1,32 +1,37 @@
 import { verifyToken } from '../auth/verify.js';
 import { getVault } from '../../../db.js';
 import { deepDecryptObject } from '../../../lib/encryptionUtils.js';
-import OpenAI from 'openai';
+import {
+  migrateLegacyVault,
+  resolveTreeVault,
+  buildRelationshipPromptRules,
+  estimateAutofillTime,
+} from '../../../lib/familyTreeUtils.js';
+import { chatCompletion, getOpenRouterClient, OPENROUTER_TEXT_MODEL } from '../../../lib/openRouterClient.js';
 
-let client = null;
-function getOpenAIClient() {
-  if (client) return client;
-  const apiKey = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-  client = new OpenAI({
-    apiKey,
-    baseURL: 'https://integrate.api.nvidia.com/v1',
-  });
-  return client;
-}
-
-const MAP_MODEL = 'meta/llama-3.1-70b-instruct';
+const MAP_MODEL = OPENROUTER_TEXT_MODEL;
 const MODEL_TIMEOUT_MS = 30000;
 
-const AUTOFILL_SYSTEM_PROMPT = `You are an intelligent form autofill engine for a personal identity vault.
+function buildAutofillSystemPrompt(familyTree) {
+  const rules = buildRelationshipPromptRules(familyTree);
+  return `You are an intelligent form autofill engine for a personal identity vault.
 You receive:
 1. A structured vault containing personal profiles and asset data for a family
-2. A user's natural language instruction (e.g. "Fill this for my wife Manisha")
+2. A user's natural language instruction (e.g. "Fill this for my wife")
 3. A DOM schema of the current web page's form fields
+
+Family members in this tree:
+- Primary: ${familyTree?.primary || 'unknown'}
+- Spouse: ${familyTree?.spouse || 'n/a'}
+- Father: ${familyTree?.father || 'n/a'}
+- Mother: ${familyTree?.mother || 'n/a'}
+- Grandfather: ${familyTree?.grandfather || 'n/a'}
+- Grandmother: ${familyTree?.grandmother || 'n/a'}
+- Children: ${(familyTree?.children || []).join(', ') || 'n/a'}
 
 Your task:
 - Determine which family member is the subject of the form (the "applicant")
-- Understand relational field labels (e.g. "Husband Name" on a form for a wife = use the primary user's name)
+- Understand relational field labels using the family tree above
 - Return ONLY a JSON array of field mappings — no explanation, no markdown
 
 Output format:
@@ -34,54 +39,25 @@ Output format:
   {
     "fieldId": "the_html_id_or_name",
     "fieldLabel": "human readable label",
-    "fieldType": "text|select|file|textarea|radio|checkbox",
+    "fieldType": "text|select|file|textarea|radio|checkbox|segmented",
     "value": "value to inject or null",
-    "documentKey": "for file fields only — see rules below",
+    "documentKey": "for file fields only",
     "confidence": "high|medium|low"
   }
 ]
 
 Relationship rules:
-- If filling for Manisha (wife): "Husband Name", "Spouse Name" fields → use Chintan's data
-- If filling for Chintan: "Spouse Name", "Wife Name" fields → use Manisha's data
-- "Emergency Contact" → use spouse's data
-- "Mother's Name" → use Geetaben's name
-- "Child Name" / "Son/Daughter Name" → use Dhyana's data
+${rules || '- Use profile data and familyTree to resolve spouse, parent, and child fields.'}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FILE UPLOAD FIELD RULES (type="file")
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-For any field with type="file", you MUST:
-- Set fieldType to "file"
-- Set value to null
-- Determine documentKey by reading the field's labelText, placeholder, ariaLabel, and name/id
+FILE UPLOAD FIELD RULES (type="file"):
+- Set fieldType to "file", value to null
+- documentKey from label: aadhaar, pan, passport, voterCard, drivingLicense, photo, resume, etc.
 
-Use this mapping to pick documentKey:
-  Label contains "aadhaar" / "aadhar" / "uid"          → documentKey: "aadhaar"
-  Label contains "pan" / "pan card" / "income tax"      → documentKey: "pan"
-  Label contains "passport"                              → documentKey: "passport"
-  Label contains "voter" / "election card" / "epic"     → documentKey: "voterCard"
-  Label contains "driving" / "licence" / "license" / "dl" → documentKey: "drivingLicense"
-  Label contains "photo" / "photograph" / "selfie" / "picture" / "image" → documentKey: "photo"
-  Label contains "resume" / "cv" / "curriculum vitae" / "upload your resume" → documentKey: "resume"
-  Label contains "signature"                             → documentKey: "signature"
-  Label contains "birth certificate" / "dob proof"      → documentKey: "birthCertificate"
-  Label contains "address proof" / "residence proof"    → documentKey: "addressProof"
-  Label contains "income proof" / "salary slip" / "itr" → documentKey: "incomeProof"
-  Label contains "bank" / "passbook" / "cheque" / "statement" → documentKey: "bankDocument"
-  Label contains "insurance"                             → documentKey: "insurance"
-  Label contains "vehicle" / "rc book" / "registration certificate" → documentKey: "vehicleRC"
-
-If the label is ambiguous (e.g. just "Upload Document" with no context):
-  - Look at surrounding fields on the form for context clues
-  - If still unclear, set documentKey to "aadhaar" as the most common ID document and confidence to "medium"
-  - If completely unresolvable, set documentKey to null and confidence to "low"
-
-For file fields, also check WHO the document belongs to:
-  - If filling for Manisha → use Manisha's driveFileIds for that document type
-  - The documentKey alone identifies the type; the profile is determined by the applicant
+SEGMENTED / BOX INPUTS:
+- One character per box → return full value without spaces for segmented fields
 
 Return ONLY the JSON array.`;
+}
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -93,20 +69,28 @@ export default async function handler(req, res) {
   const user = await verifyToken(req, res);
   if (!user) return;
 
-  const { userInstruction, domSchema } = req.body;
+  const { userInstruction, domSchema, treeId } = req.body;
   if (!userInstruction || !domSchema) {
     return res.status(400).json({ error: 'userInstruction and domSchema are required' });
   }
 
-  const vault = await getVault(user.uid);
-  if (!vault) {
-    return res.status(404).json({ error: 'Vault not found. Please sync your documents first.' });
+  const rawVault = await getVault(user.uid);
+  if (!rawVault) {
+    return res.status(404).json({ error: 'Vault not found. Please create a family tree and sync documents first.' });
+  }
+
+  const container = migrateLegacyVault(rawVault);
+  const treeCtx = resolveTreeVault(container, treeId);
+  if (!treeCtx) {
+    return res.status(404).json({ error: 'Family tree not found. Create a family tree first.' });
   }
 
   const decryptedVault = {
-    ...vault,
-    profiles: deepDecryptObject(vault.profiles),
-    assets: deepDecryptObject(vault.assets),
+    familyTree: treeCtx.tree.familyTree,
+    profiles: deepDecryptObject(treeCtx.tree.profiles || {}),
+    assets: deepDecryptObject(treeCtx.tree.assets || {}),
+    treeId: treeCtx.treeId,
+    treeName: treeCtx.tree.name,
   };
 
   // Keep the full decrypted vault for file ID lookup later
@@ -137,32 +121,29 @@ IMPORTANT:
 
 Return the field mapping JSON array now.`;
 
+  const timeEstimate = estimateAutofillTime(domSchema, { needsModel });
+  const systemPrompt = buildAutofillSystemPrompt(decryptedVault.familyTree);
+
   try {
-    const openaiClient = getOpenAIClient();
-    let response = null;
-    if (needsModel && openaiClient) {
-      const modelRequest = openaiClient.chat.completions.create({
-        model: MAP_MODEL,
-        max_tokens: 2000,
-        messages: [
-          { role: 'system', content: AUTOFILL_SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-      });
-      response = await withTimeout(
-        modelRequest,
+    const openrouter = getOpenRouterClient();
+    let clean = '';
+    if (needsModel && openrouter) {
+      const rawText = await withTimeout(
+        chatCompletion({
+          model: MAP_MODEL,
+          maxTokens: 2000,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage },
+          ],
+        }),
         MODEL_TIMEOUT_MS,
         `Mapping model timed out after ${MODEL_TIMEOUT_MS / 1000} seconds`
       ).catch((err) => {
         console.warn('Mapping model unavailable, falling back to heuristics:', err.message);
-        return null;
+        return '';
       });
-    }
-
-    let clean = '';
-    if (needsModel && response) {
-      const rawText = response.choices[0]?.message?.content || '';
-      clean = rawText.replace(/```json|```/g, '').trim();
+      clean = (rawText || '').replace(/```json|```/g, '').trim();
     }
 
     function tryParseJson(text) {
@@ -257,6 +238,9 @@ Return the field mapping JSON array now.`;
     return res.status(200).json({
       mappings: deduped,
       unmappedFields: failedFields,
+      treeId: treeCtx.treeId,
+      treeName: treeCtx.tree.name,
+      estimatedTime: timeEstimate,
       summary: {
         total: deduped.length,
         mapped: successfulMappings.length,
@@ -464,14 +448,39 @@ function collectDocumentValues(profile, vault, applicantProfileKey) {
     assignIfMissing('aadhaar', identities.aadhaar?.aadhaarNumber || identities.aadhaar?.idNumber || pd.aadhaarNumber || pd.idNumber);
     assignIfMissing('pan', identities.pan?.panNumber || identities.pan?.idNumber || pd.panNumber || pd.idNumber);
     assignIfMissing('pincode', identities.aadhaar?.pincode || identities.pan?.pincode || pd.pincode);
+    assignIfMissing('email', pd.email || pd.emailAddress);
+    assignIfMissing('phone', pd.phone || pd.phoneNumber || pd.mobile);
+    assignIfMissing('businessName', pd.businessName);
+    assignIfMissing('website', pd.website);
+    assignIfMissing('fatherName', pd.fatherName);
+    assignIfMissing('motherName', pd.motherName);
+    if (pd.middleName) assignIfMissing('middleName', pd.middleName);
 
     for (const doc of Object.values(identities)) {
       assignIfMissing('aadhaar', doc.aadhaarNumber || doc.idNumber || doc.documentNumber);
       assignIfMissing('pan', doc.panNumber || doc.idNumber || doc.documentNumber);
-      assignIfMissing('pincode', doc.pincode);
+      assignIfMissing('pincode', doc.pincode || (doc.address?.match(/\b(\d{6})\b/)?.[1]));
+      assignIfMissing('email', doc.email);
+      assignIfMissing('fatherName', doc.fatherName);
+      assignIfMissing('motherName', doc.motherName);
+      if (doc.name) {
+        const parts = doc.name.split(' ').filter(Boolean);
+        if (parts.length > 2) assignIfMissing('middleName', parts.slice(1, -1).join(' '));
+      }
     }
 
     for (const doc of documents) {
+      assignIfMissing('pincode', doc.pincode || (doc.address?.match(/\b(\d{6})\b/)?.[1]));
+      assignIfMissing('email', doc.email || doc.otherDetails?.email);
+      assignIfMissing('phone', doc.phone || doc.phoneNumber || doc.otherDetails?.phone || doc.otherDetails?.phoneNumber);
+      assignIfMissing('businessName', doc.businessName || doc.otherDetails?.businessName || doc.otherDetails?.BusinessName);
+      assignIfMissing('website', doc.website || doc.otherDetails?.website || doc.otherDetails?.Website);
+      assignIfMissing('fatherName', doc.fatherName);
+      assignIfMissing('motherName', doc.motherName);
+      if (doc.name) {
+        const parts = doc.name.split(' ').filter(Boolean);
+        if (parts.length > 2) assignIfMissing('middleName', parts.slice(1, -1).join(' '));
+      }
       const blob = normalize([
         doc.documentType,
         doc.name,
@@ -511,7 +520,11 @@ function inferCommonField(field, vault, userInstruction) {
   const fullName = pd.fullName || pd.name || [pd.firstName, pd.middleName, pd.lastName].filter(Boolean).join(' ') || '';
   const { firstName, middleName, lastName } = splitNameParts(fullName);
   
-  let effectiveMiddleName = middleName;
+  let effectiveMiddleName = pd.middleName || documentLookup.middleName || middleName;
+  if (!effectiveMiddleName && idDoc.name) {
+    const { middleName: idMiddle } = splitNameParts(idDoc.name);
+    effectiveMiddleName = idMiddle;
+  }
   if (!effectiveMiddleName) {
     if (applicantProfileKey === 'primary' && familyTree.primary) {
       const { middleName: ftMiddleName } = splitNameParts(familyTree.primary);
@@ -522,13 +535,38 @@ function inferCommonField(field, vault, userInstruction) {
     }
   }
 
+  if (!effectiveMiddleName && applicantProfileKey === 'primary' && familyTree.father) {
+    effectiveMiddleName = splitNameParts(familyTree.father).firstName || familyTree.father;
+  }
+
+  // Pull middle name from any identity doc name if still missing
+  if (!effectiveMiddleName) {
+    for (const idData of Object.values(profile.identities || {})) {
+      if (idData?.name) {
+        const { middleName: mn } = splitNameParts(idData.name);
+        if (mn) { effectiveMiddleName = mn; break; }
+      }
+    }
+  }
+
+  const fatherFromTree = familyTree.father || null;
+  const motherFromTree = familyTree.mother || null;
+  const fatherFromDocs = pd.fatherName || idDoc.fatherName || profile.identities?.pan?.fatherName
+    || documentLookup.fatherName
+    || profile.documents?.find((d) => d.fatherName)?.fatherName
+    || fatherFromTree || null;
+  const motherFromDocs = pd.motherName || idDoc.motherName || documentLookup.motherName
+    || profile.documents?.find((d) => d.motherName)?.motherName
+    || motherFromTree || null;
+
   const dob = pd.dob || idDoc.dob || null;
   const rawGender = (pd.gender || idDoc.gender || '').toLowerCase();
   const gender = rawGender.includes('female') ? 'female' : rawGender.includes('male') ? 'male' : rawGender;
   const aadhaarNumber = documentLookup.aadhaar || idDoc.aadhaarNumber || idDoc.idNumber || pd.aadhaarNumber || pd.idNumber || null;
   const panNumber = documentLookup.pan || idDoc.panNumber || pd.panNumber || null;
   const nationalId = idDoc.idNumber || idDoc.aadhaarNumber || pd.idNumber || pd.aadhaarNumber || panNumber || null;
-  const address = idDoc.address || pd.address || null;
+  const address = idDoc.address || pd.address
+    || profile.documents?.find((d) => d.address)?.address || null;
   let pincode = documentLookup.pincode || idDoc.pincode || pd.pincode || null;
   
  
@@ -539,34 +577,31 @@ function inferCommonField(field, vault, userInstruction) {
     }
   }
   
-  const email = pd.email || pd.emailAddress || profile.documents?.find((doc) => doc.otherDetails?.email)?.otherDetails.email || null;
-  const phone = pd.phone || pd.phoneNumber || pd.mobile || null;
+  const email = pd.email || pd.emailAddress || documentLookup.email
+    || profile.documents?.find((doc) => doc.email || doc.otherDetails?.email)?.email
+    || profile.documents?.find((doc) => doc.otherDetails?.email)?.otherDetails?.email
+    || Object.values(profile.identities || {}).find((id) => id.email)?.email
+    || null;
+  const phone = pd.phone || pd.phoneNumber || pd.mobile || documentLookup.phone || null;
+  const businessName = pd.businessName || documentLookup.businessName || null;
+  const website = pd.website || documentLookup.website || null;
+  const otherName = otherProfile?.personalDetails?.fullName || otherProfile?.personalDetails?.name || [otherProfile?.personalDetails?.firstName, otherProfile?.personalDetails?.lastName].filter(Boolean).join(' ') || null;
+  const spouseName = familyTree.spouse || otherName || vault.profiles?.spouse?.personalDetails?.fullName || vault.profiles?.spouse?.personalDetails?.name || null;
+  const primaryName = familyTree.primary || vault.profiles?.primary?.personalDetails?.fullName
+    || vault.profiles?.primary?.personalDetails?.name || null;
+  const spouseLabelName = familyTree.spouse || spouseName;
   const rawFieldText = normalize([field.id, field.name, field.labelText, field.placeholder, field.ariaLabel, field.ariaDescribedBy, field.groupLabel].filter(Boolean).join(' '));
   const lastDigitsMatch = label.match(/last\s*(\d+)|(?:(?:ending\s+in|ending\s+with)\s*)(\d+)|(?:\b(\d+)\s*digits?\b)/i);
   const lastDigitsCount = lastDigitsMatch ? Number(lastDigitsMatch[1] || lastDigitsMatch[2] || lastDigitsMatch[3]) : null;
   const lastDigitsAadhaar = lastDigitsCount ? extractLastDigits(aadhaarNumber || nationalId, lastDigitsCount) : null;
   const city = address ? address.split(/,|\n/).map((s) => s.trim()).filter(Boolean).slice(-2, -1)[0] || address.split(/,|\n/).map((s) => s.trim()).filter(Boolean)[0] : null;
   const state = address ? address.split(/,|\n/).map((s) => s.trim()).filter(Boolean).slice(-1)[0] : null;
-  const otherName = otherProfile?.personalDetails?.fullName || otherProfile?.personalDetails?.name || [otherProfile?.personalDetails?.firstName, otherProfile?.personalDetails?.lastName].filter(Boolean).join(' ') || null;
-  const spouseName = familyTree.spouse || otherName || vault.profiles?.spouse?.personalDetails?.fullName || vault.profiles?.spouse?.personalDetails?.name || null;
-  const motherName = familyTree.mother || vault.profiles?.mother?.personalDetails?.fullName || vault.profiles?.mother?.personalDetails?.name || null;
+  const grandfatherName = familyTree.grandfather || vault.profiles?.grandfather?.personalDetails?.fullName || null;
+  const grandmotherName = familyTree.grandmother || vault.profiles?.grandmother?.personalDetails?.fullName || null;
+  const fatherName = fatherFromDocs;
+  const motherName = motherFromDocs;
   const emergencyContact = spouseName || motherName || null;
-  let fatherName = null;
-  if (familyTree.father) {
-    fatherName = familyTree.father;
-  } else if (vault.profiles?.father?.personalDetails?.fullName) {
-    fatherName = vault.profiles.father.personalDetails.fullName;
-  } else if (vault.profiles?.father?.personalDetails?.name) {
-    fatherName = vault.profiles.father.personalDetails.name;
-  } else if (familyTree.primary) {
-    const { middleName: primaryMiddleName } = splitNameParts(familyTree.primary);
-    fatherName = primaryMiddleName || null;
-  }
-  
   const childName = Array.isArray(familyTree.children) && familyTree.children.length ? familyTree.children[0] : vault.profiles?.children_0?.personalDetails?.fullName || vault.profiles?.children_0?.personalDetails?.name || null;
-
-  if (/password|passcode|pin\b/.test(label) || field.type === 'password') return null;
-  if (/declaration|consent|agree|confirm|checkbox.*legal/.test(label)) return null;
 
   if (lastDigitsAadhaar) return lastDigitsAadhaar;
   if (/last 4|last4|last-four|last four/.test(label)) return aadhaarNumber ? aadhaarNumber.toString().replace(/\D/g, '').slice(-4) : null;
@@ -584,10 +619,16 @@ function inferCommonField(field, vault, userInstruction) {
 
   if (/city\b/.test(label)) return city || null;
   if (/state|province|region/.test(label)) return state || null;
-  if (/pin\s*\/\s*zip|zip\s*\/\s*pin|pin|zip|postal code/.test(label)) {
+
+  // PIN / ZIP — must run before generic "pin" password guard
+  if (/pin\s*code|pincode|postal\s*code|zip\s*code|zipcode|zip\b|post\s*code|pin\s*\/\s*zip|zip\s*\/\s*pin|\bpin\b/.test(label)
+      && !/password|otp|atm|card\s*pin|security\s*pin|pin\s*number\s*for/.test(label)) {
     if (pincode) return pincode.toString().replace(/\D/g, '');
     return null;
   }
+
+  if (/password|passcode/.test(label) || field.type === 'password') return null;
+  if (/declaration|consent|agree|confirm|checkbox.*legal/.test(label)) return null;
   if (/emergency\s*contact\s*name|emergency\s*contact\b/.test(label) && !/phone|mobile|relation/.test(label)) {
     return emergencyContact;
   }
@@ -607,8 +648,14 @@ function inferCommonField(field, vault, userInstruction) {
   if (/nationality/.test(label)) return address && address.toLowerCase().includes('india') ? 'Indian' : null;
 
   // Contact
-  if (/phone|mobile|contact/.test(label)) return phone || null;
-  if (/email/.test(label)) return email || null;
+  if (/business\s*name|company\s*name|organisation|organization|firm\s*name|trade\s*name/.test(label)) {
+    return businessName || null;
+  }
+  if (/website|web\s*site|web\s*address|company\s*url|site\s*url/.test(label)) {
+    return website || null;
+  }
+  if (/phone|mobile|contact\s*number|telephone|cell/.test(label) && !/email/.test(label)) return phone || null;
+  if (/email|e-mail/.test(label)) return email || null;
 
   // Name fields - be more specific
   if (/verified applicant|verified name|applicant name|applicant full name|full legal name|full name|surname and given name|complete name/.test(label)) return fullName || null;
@@ -622,9 +669,23 @@ function inferCommonField(field, vault, userInstruction) {
   // Last name
   if (/last\s*name|surname|family\s*name|\blast\b/.test(label) && !/first|middle|given/.test(label)) return lastName || null;
 
-  // Family relationships
-  if (/\bspouse\b|\bhusband\b|\bwife\b|\bpartner\b/.test(label)) return spouseName || null;
-  if (/emergency contact|emergency phone|emergency mobile/.test(label)) return spouseName || null;
+  if (/grandfather|grand father|paternal grandfather/.test(label)) return grandfatherName || null;
+  if (/grandmother|grand mother|paternal grandmother/.test(label)) return grandmotherName || null;
+
+  // Family relationships — wife and spouse are the same person
+  if (/husband.?name|husband.?s name|name of husband|father.?in.?law/.test(label) && !/mother/.test(label)) {
+    return applicantProfileKey === 'spouse' ? primaryName : fatherName || null;
+  }
+  if (/wife.?name|wife.?s name|spouse.?name|name of (wife|spouse)|partner.?name/.test(label)) {
+    return applicantProfileKey === 'primary' ? spouseLabelName : null;
+  }
+  if (/\bspouse\b|\bpartner\b/.test(label) && !/emergency/.test(label)) return spouseLabelName || null;
+  if (/\bwife\b/.test(label) && !/husband/.test(label)) {
+    return applicantProfileKey === 'primary' ? spouseLabelName : (applicantProfileKey === 'spouse' ? fullName : null);
+  }
+  if (/\bhusband\b/.test(label) && !/wife|father|mother/.test(label)) {
+    return applicantProfileKey === 'spouse' ? primaryName : null;
+  }
   
   // Mother
   if (/\bmother\b|\bmom\b|\bmum\b|\bmama\b|\bma\b/.test(label) && !/father|grand|in-law/.test(label)) return motherName || null;
@@ -660,9 +721,11 @@ function normalizeFieldText(field) {
 
 function getApplicantProfileKey(vault, instruction) {
   const profiles = vault.profiles || {};
+  const familyTree = vault.familyTree || {};
   const keys = Object.keys(profiles);
   const text = normalize(instruction);
   if (!text) return keys.includes('primary') ? 'primary' : keys[0] || null;
+
   for (const [key, profile] of Object.entries(profiles)) {
     const names = [
       profile.personalDetails?.fullName,
@@ -675,12 +738,35 @@ function getApplicantProfileKey(vault, instruction) {
       return key;
     }
   }
-  if (/(wife|spouse|partner|woman|she|her|manisha)/.test(text)) {
-    return keys.find((k) => /spouse|wife|partner|woman/i.test(k)) || keys.find((k) => normalize(profiles[k]?.personalDetails?.fullName || '').includes('manisha')) || (keys.includes('spouse') ? 'spouse' : null);
+
+  const treeNames = [
+    { key: 'spouse', names: [familyTree.spouse] },
+    { key: 'primary', names: [familyTree.primary] },
+    { key: 'father', names: [familyTree.father] },
+    { key: 'mother', names: [familyTree.mother] },
+    { key: 'grandfather', names: [familyTree.grandfather] },
+    { key: 'grandmother', names: [familyTree.grandmother] },
+    ...(familyTree.children || []).map((c, i) => ({ key: `children_${i}`, names: [c] })),
+  ];
+  for (const { key, names } of treeNames) {
+    for (const n of names) {
+      const nn = normalize(n);
+      if (nn && (text.includes(nn) || nn.includes(text))) return keys.includes(key) ? key : key;
+    }
   }
-  if (/(husband|man|he|his|chintan|primary)/.test(text)) {
-    return keys.find((k) => /primary|husband|man/i.test(k)) || keys.find((k) => normalize(profiles[k]?.personalDetails?.fullName || '').includes('chintan')) || (keys.includes('primary') ? 'primary' : null);
+
+  if (/(wife|spouse|partner|husband)/.test(text) && keys.includes('spouse')) return 'spouse';
+  if (/\bwife\b|\bmy wife\b|\bfor wife\b|\bwife's\b|\bwifes\b/.test(text) && keys.includes('spouse')) return 'spouse';
+  if (/\bhusband\b|\bmy husband\b|\bfor husband\b/.test(text) && keys.includes('spouse')) return 'spouse';
+  if (/(father|dad|papa)/.test(text) && keys.includes('father')) return 'father';
+  if (/(mother|mom|mama)/.test(text) && keys.includes('mother')) return 'mother';
+  if (/(daughter|son|child|kid)/.test(text)) {
+    const childKey = keys.find((k) => k.startsWith('children_'));
+    if (childKey) return childKey;
   }
+  if (/(grandfather|grandpa)/.test(text) && keys.includes('grandfather')) return 'grandfather';
+  if (/(grandmother|grandma)/.test(text) && keys.includes('grandmother')) return 'grandmother';
+
   return keys.includes('primary') ? 'primary' : keys[0] || null;
 }
 
@@ -723,8 +809,11 @@ function inferDocumentKey(field) {
 function buildAutoMappings(domSchema, vault, userInstruction) {
   return domSchema.map((field) => {
     const label = normalizeFieldText(field);
+    const isSegmented = field.fieldType === 'segmented' || field.type === 'segmented';
     const normalizedType = (field.type || field.tagName || '').toLowerCase();
-    const fieldType = normalizedType.includes('radio')
+    const fieldType = isSegmented
+      ? 'segmented'
+      : normalizedType.includes('radio')
       ? 'radio'
       : normalizedType.includes('checkbox')
       ? 'checkbox'
@@ -735,7 +824,10 @@ function buildAutoMappings(domSchema, vault, userInstruction) {
       : normalizedType === 'file' || (field.tagName || '').toLowerCase() === 'input' && normalizedType === 'file'
       ? 'file'
       : 'text';
-    const value = fieldType === 'file' ? null : inferCommonField(field, vault, userInstruction);
+    let value = fieldType === 'file' ? null : inferCommonField(field, vault, userInstruction);
+    if (fieldType === 'segmented' && value) {
+      value = value.toString().replace(/\s+/g, '');
+    }
     const documentKey = fieldType === 'file' ? inferDocumentKey(field) : null;
     const confidence = fieldType === 'file'
       ? documentKey ? 'high' : 'low'
@@ -745,11 +837,13 @@ function buildAutoMappings(domSchema, vault, userInstruction) {
     return {
       fieldId: field.id || null,
       fieldName: field.name || null,
-      fieldLabel: label || field.id || field.name || '',
+      fieldLabel: label || field.labelText || field.id || field.name || '',
       fieldType,
       value,
       documentKey,
       confidence,
+      segmentIds: field.segmentIds || null,
+      segmentCount: field.segmentCount || null,
     };
   });
 }

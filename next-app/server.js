@@ -106,6 +106,8 @@ app.post('/api/auth/signup',   route(() => import('./src/pages/api/auth/signup.j
 app.post('/api/vault/sync',    route(() => import('./src/pages/api/vault/sync.js')));
 app.post('/api/vault/seed',    route(() => import('./src/pages/api/vault/seed.js')));
 app.get('/api/vault/status',   route(() => import('./src/pages/api/vault/status.js')));
+app.get('/api/vault/trees',    route(() => import('./src/pages/api/vault/trees.js')));
+app.post('/api/vault/trees',   route(() => import('./src/pages/api/vault/trees.js')));
 app.get('/api/vault/profiles', route(() => import('./src/pages/api/vault/profiles.js')));
 
 

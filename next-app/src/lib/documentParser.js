@@ -1,12 +1,10 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { parseDocumentWithVision } from './openRouterClient.js';
 import { verifyToken } from '../pages/api/auth/verify.js';
 import { createSyncJob, updateSyncJob, addArchivedDocument, setVault } from '../db.js';
 import { extractFolderId, listAllFiles, getDriveClient } from './driveClient.js';
 import { deepEncryptObject } from './encryptionUtils.js';
 import sharp from 'sharp';
 import { PDFParse } from 'pdf-parse';
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const PARSE_PROMPTS = {
   aadhaar: `Extract from this Aadhaar card. Return ONLY valid JSON, no explanation:
@@ -326,34 +324,15 @@ export async function parseDocumentGroup(group) {
 
     console.log(`    📤 Sending: ${imageFiles.length} images + ${textParts.length} text sources`);
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
-    // ✅ Enhanced prompt to extract family relationships
-    const content = [
-      {
-        text: `Extract data from this ${documentType} document. Also identify family relationships.
+    const rawText = await parseDocumentWithVision({
+      prompt: `Extract data from this ${documentType} document. Also identify family relationships.
 Return ONLY valid JSON:
-${PARSE_PROMPTS[documentType]}
+${PARSE_PROMPTS[documentType] || PARSE_PROMPTS.unknown}
 
 IMPORTANT: If you see spouse name, father name, mother name, or children names mentioned, include them in the response.`,
-      },
-      ...imageFiles.map(file => ({
-        inlineData: {
-          mimeType: file.mimeType,
-          data: file.base64,
-        },
-      })),
-      ...(textParts.length > 0
-        ? [
-          {
-            text: `\n\n--- Additional extracted text content ---\n${textParts.join('\n\n')}`,
-          },
-        ]
-        : []),
-    ];
-
-    const response = await model.generateContent(content);
-    const rawText = response.response.text();
+      imageFiles,
+      textParts,
+    });
 
     console.log(`    📝 Response: ${rawText.slice(0, 200)}`);
 

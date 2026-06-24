@@ -52,6 +52,53 @@ header {
 
 .error-msg { color: #d93025; font-size: 13px; min-height: 18px; }
 
+.tree-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #e8eaed;
+  background: #f8f9fa;
+  flex-shrink: 0;
+}
+.tree-bar label { font-size: 12px; color: #5f6368; white-space: nowrap; }
+.tree-select {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #dadce0;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+}
+.btn-sm { padding: 4px 10px !important; font-size: 12px !important; }
+.autofill-loader-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.autofill-steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+.autofill-steps li {
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 2px 0;
+  color: #9aa0a6;
+}
+
+.autofill-steps li.step-done { color: #3c4043; }
+.autofill-steps li.step-active { color: #1a73e8; font-weight: 500; }
+.autofill-steps li.step-pending { color: #bdc1c6; }
+
+.autofill-step-detail {
+  font-size: 11px;
+  color: #80868b;
+  font-weight: 400;
+}
+
 /* Main chat screen */
 #main-screen { padding: 0; }
 
@@ -121,7 +168,7 @@ header {
 
 .autofill-loader {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   margin-top: 10px;
   color: #1a73e8;

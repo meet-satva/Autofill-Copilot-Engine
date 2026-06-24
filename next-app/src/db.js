@@ -6,12 +6,37 @@ const { Pool } = pg;
 let pool;
 let schemaReady;
 
+function getConnectionString() {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL must be defined');
+  }
+
+  try {
+    const url = new URL(connectionString);
+    if (url.searchParams.get('sslmode') === 'require' && !url.searchParams.has('uselibpqcompat')) {
+      url.searchParams.set('uselibpqcompat', 'true');
+      return url.toString();
+    }
+  } catch {
+    return connectionString;
+  }
+
+  return connectionString;
+}
+
 function getPool() {
   if (!pool) {
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
+      connectionString: getConnectionString(),
       ssl: { rejectUnauthorized: false },
       max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    });
+
+    pool.on('error', (err) => {
+      console.error('Unexpected pg pool error:', err);
     });
   }
   return pool;
@@ -154,12 +179,12 @@ export async function setVault(userId, data) {
 }
 
 // ── Sync job helpers ──────────────────────────────────────────────────────────
-export async function createSyncJob({ userId, folderUrl }) {
+export async function createSyncJob({ userId, folderUrl, treeId }) {
   const res = await query(
     `INSERT INTO sync_jobs (user_id, status, folder_url, progress, started_at)
      VALUES ($1, 'running', $2, $3, now())
      RETURNING id`,
-    [userId, folderUrl, JSON.stringify({ total: 0, processed: 0, failed: 0 })]
+    [userId, folderUrl, JSON.stringify({ total: 0, processed: 0, failed: 0, treeId: treeId || null })]
   );
   return res.rows[0].id;
 }

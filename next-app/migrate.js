@@ -5,8 +5,27 @@ import 'dotenv/config';
 import pg from 'pg';
 const { Pool } = pg;
 
+function getConnectionString() {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL must be defined');
+  }
+
+  try {
+    const url = new URL(connectionString);
+    if (url.searchParams.get('sslmode') === 'require' && !url.searchParams.has('uselibpqcompat')) {
+      url.searchParams.set('uselibpqcompat', 'true');
+      return url.toString();
+    }
+  } catch {
+    return connectionString;
+  }
+
+  return connectionString;
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: getConnectionString(),
   ssl: { rejectUnauthorized: false },
 });
 

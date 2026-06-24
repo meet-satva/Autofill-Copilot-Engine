@@ -57,6 +57,86 @@ function sendChromeMessage(message) {
   });
 }
 
+async function sendContentMessage(message) {
+  return sendChromeMessage(message);
+}
+
+async function setPageOverlay(show, payload = 'Autofilling your form…') {
+  try {
+    if (show) {
+      await sendContentMessage({ type: 'SHOW_AUTOFILL_OVERLAY', payload });
+    } else {
+      await sendContentMessage({ type: 'HIDE_AUTOFILL_OVERLAY' });
+    }
+  } catch (_) { /* page may not allow overlay */ }
+}
+
+async function updatePageOverlay(payload) {
+  try {
+    await sendContentMessage({ type: 'UPDATE_AUTOFILL_OVERLAY', payload });
+  } catch (_) {}
+}
+
+const AUTOFILL_STEP_DEFS = [
+  { id: 'scan', label: 'Scanning form on page' },
+  { id: 'vault', label: 'Loading vault from database' },
+  { id: 'map', label: 'Extracting & matching field values' },
+  { id: 'fill', label: 'Injecting values into form' },
+  { id: 'files', label: 'Attaching documents from vault' },
+];
+
+function buildAutofillSteps(activeId, detailById = {}, options = {}) {
+  const defs = options.includeFiles === false
+    ? AUTOFILL_STEP_DEFS.filter((s) => s.id !== 'files')
+    : AUTOFILL_STEP_DEFS;
+  const activeIndex = defs.findIndex((s) => s.id === activeId);
+  return defs.map((step, index) => ({
+    ...step,
+    status: index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending',
+    detail: detailById[step.id] || '',
+  }));
+}
+
+function renderAutofillSteps(steps) {
+  const list = $('autofill-steps');
+  if (!list) return;
+  if (!steps?.length) {
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = steps.map((step) => {
+    const icon = step.status === 'done' ? '✓' : step.status === 'active' ? '●' : '○';
+    const detail = step.detail ? `<div class="autofill-step-detail">${escapeHtml(step.detail)}</div>` : '';
+    return `<li class="step-${step.status}">${icon} ${escapeHtml(step.label)}${detail}</li>`;
+  }).join('');
+}
+
+function setAutofillProgress(activeId, detail = '', options = {}) {
+  const steps = options.steps || buildAutofillSteps(activeId, { [activeId]: detail }, options);
+  renderAutofillSteps(steps);
+  const activeStep = steps.find((s) => s.status === 'active');
+  const textEl = $('autofill-loader-text');
+  if (textEl && activeStep) {
+    textEl.textContent = activeStep.detail ? `${activeStep.label}…` : `${activeStep.label}…`;
+  }
+  updatePageOverlay({ steps, message: detail || '' });
+}
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type !== 'AUTOFILL_PROGRESS') return;
+  if (message.steps?.length) {
+    renderAutofillSteps(message.steps);
+    const activeStep = message.steps.find((s) => s.status === 'active');
+    const textEl = $('autofill-loader-text');
+    if (textEl && activeStep) {
+      textEl.textContent = `${activeStep.label}…`;
+    }
+  } else if (message.message) {
+    const textEl = $('autofill-loader-text');
+    if (textEl) textEl.textContent = message.message;
+  }
+});
+
 // DOM helpers
 const $ = id => document.getElementById(id);
 const loginScreen = $('login-screen');
@@ -87,12 +167,146 @@ function setStatus(text, ok = true) {
   $('auth-status').style.color = ok ? '#1a73e8' : '#d93025';
 }
 
+// Family trees state
+let familyTrees = [];
+let activeTreeId = null;
+
+async function loadFamilyTrees() {
+  const token = await getValidToken();
+  if (!token) return;
+  try {
+    const res = await fetch(`${getBackendUrl()}/api/vault/trees`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await readJsonResponse(res);
+    if (!res.ok) return;
+    familyTrees = data.trees || [];
+    activeTreeId = data.activeTreeId || familyTrees[0]?.id || null;
+    const stored = await chrome.storage.local.get(['activeTreeId']);
+    if (stored.activeTreeId && familyTrees.some((t) => t.id === stored.activeTreeId)) {
+      activeTreeId = stored.activeTreeId;
+    }
+    renderTreeSelector();
+    renderQuickChips();
+  } catch (_) {}
+}
+
+function renderTreeSelector() {
+  const sel = $('tree-select');
+  if (!sel) return;
+  sel.innerHTML = '';
+  if (!familyTrees.length) {
+    sel.innerHTML = '<option value="">No family tree — create one</option>';
+    return;
+  }
+  for (const t of familyTrees) {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = `${t.name} (${t.primary})`;
+    if (t.id === activeTreeId) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function getSelectedTreeId() {
+  const sel = $('tree-select');
+  return sel?.value || activeTreeId || familyTrees[0]?.id || null;
+}
+
+function renderQuickChips() {
+  const container = $('quick-prompts');
+  if (!container) return;
+  container.innerHTML = '<span class="label">Quick:</span>';
+  const tree = familyTrees.find((t) => t.id === getSelectedTreeId());
+  if (!tree) return;
+
+  const addChip = (label, prompt) => {
+    const btn = document.createElement('button');
+    btn.className = 'chip';
+    btn.dataset.prompt = prompt;
+    btn.textContent = label;
+    btn.addEventListener('click', () => { chatInput.value = prompt; chatInput.focus(); });
+    container.appendChild(btn);
+  };
+
+  if (tree.primary) addChip(tree.primary.split(' ')[0], `Fill this form for ${tree.primary}`);
+  if (tree.spouse) addChip(tree.spouse.split(' ')[0], `Fill this form for my spouse ${tree.spouse}`);
+  if (tree.father) addChip(tree.father.split(' ')[0], `Fill this form for my father ${tree.father}`);
+  if (tree.mother) addChip(tree.mother.split(' ')[0], `Fill this form for my mother ${tree.mother}`);
+  (tree.children || []).forEach((child, i) => {
+    addChip(child.split(' ')[0], `Fill this form for my child ${child}`);
+  });
+}
+
+$('tree-select')?.addEventListener('change', async () => {
+  activeTreeId = getSelectedTreeId();
+  await chrome.storage.local.set({ activeTreeId });
+  renderQuickChips();
+});
+
+$('btn-new-tree')?.addEventListener('click', () => {
+  $('btn-sync-toggle')?.click();
+  document.querySelectorAll('.sync-tab').forEach((t) => t.classList.remove('active'));
+  $('tab-family')?.classList.add('active');
+  $('panel-family')?.classList.remove('hidden');
+  $('panel-seed')?.classList.add('hidden');
+  $('panel-drive')?.classList.add('hidden');
+});
+
+$('btn-save-tree')?.addEventListener('click', async () => {
+  const statusEl = $('tree-status');
+  const primary = $('member-primary')?.value?.trim();
+  if (!primary) {
+    statusEl.textContent = 'Primary user name is required.';
+    statusEl.className = 'sync-status-msg error';
+    return;
+  }
+  const token = await getValidToken();
+  if (!token) { showScreen('login'); return; }
+
+  const childrenRaw = $('member-children')?.value?.trim() || '';
+  const children = childrenRaw ? childrenRaw.split(',').map((s) => s.trim()).filter(Boolean) : [];
+
+  $('btn-save-tree').disabled = true;
+  statusEl.textContent = 'Saving family tree…';
+  statusEl.className = 'sync-status-msg thinking';
+
+  try {
+    const res = await fetch(`${getBackendUrl()}/api/vault/trees`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        treeName: $('tree-name')?.value?.trim() || `${primary}'s Family`,
+        primary,
+        spouse: $('member-spouse')?.value?.trim() || null,
+        father: $('member-father')?.value?.trim() || null,
+        mother: $('member-mother')?.value?.trim() || null,
+        children,
+        setActive: true,
+      }),
+    });
+    const data = await readJsonResponse(res);
+    if (!res.ok) throw new Error(data.error || 'Failed to save tree');
+    activeTreeId = data.treeId;
+    await chrome.storage.local.set({ activeTreeId });
+    statusEl.textContent = '✅ Family tree saved!';
+    statusEl.className = 'sync-status-msg success';
+    await loadFamilyTrees();
+  } catch (err) {
+    statusEl.textContent = err.message;
+    statusEl.className = 'sync-status-msg error';
+  } finally {
+    $('btn-save-tree').disabled = false;
+  }
+});
+
 // Init — check for stored auth
 (async () => {
   const token = await getValidToken();
   if (token) {
     showScreen('main');
     setStatus('Vault connected', true);
+    await loadFamilyTrees();
   } else {
     showScreen('login');
   }
@@ -117,6 +331,7 @@ $('btn-login').addEventListener('click', async () => {
     await chrome.storage.local.set({ sessionToken: data.token });
     showScreen('main');
     setStatus('Vault connected', true);
+    await loadFamilyTrees();
   } catch (err) {
     $('login-error').textContent = err.message;
   } finally {
@@ -142,6 +357,7 @@ $('btn-signup').addEventListener('click', async () => {
     await chrome.storage.local.set({ sessionToken: data.token });
     showScreen('main');
     setStatus('Vault connected', true);
+    await loadFamilyTrees();
   } catch (err) {
     $('login-error').textContent = err.message;
   } finally {
@@ -162,6 +378,7 @@ document.querySelectorAll('.sync-tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.sync-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
+    $('panel-family').classList.toggle('hidden', tab.dataset.tab !== 'family');
     $('panel-seed').classList.toggle('hidden', tab.dataset.tab !== 'seed');
     $('panel-drive').classList.toggle('hidden', tab.dataset.tab !== 'drive');
   });
@@ -232,6 +449,13 @@ $('btn-sync-drive').addEventListener('click', async () => {
     return;
   }
 
+  const treeId = getSelectedTreeId();
+  if (!treeId) {
+    statusEl.textContent = 'Create a family tree first (Family Tree tab).';
+    statusEl.className = 'sync-status-msg error';
+    return;
+  }
+
   const token = await getValidToken();
   if (!token) { showScreen('login'); return; }
 
@@ -248,7 +472,7 @@ $('btn-sync-drive').addEventListener('click', async () => {
     const res = await fetch(`${backendUrl}/api/vault/sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ folderUrl }),
+      body: JSON.stringify({ folderUrl, treeId }),
     });
 
     const data = await readJsonResponse(res);
@@ -272,6 +496,7 @@ $('btn-sync-drive').addEventListener('click', async () => {
         if (job.status === 'completed') {
           statusEl.textContent = `✅ Synced! ${job.progress?.processed ?? 0} docs processed.`;
           statusEl.className = 'sync-status-msg success';
+          await loadFamilyTrees();
           done = true;
         } else if (job.status === 'failed') {
           statusEl.textContent = `❌ Sync failed: ${job.error || 'Unknown error'}`;
@@ -296,14 +521,6 @@ $('btn-sync-drive').addEventListener('click', async () => {
   }
 });
 
-// Quick prompt chips
-document.querySelectorAll('.chip').forEach(chip => {
-  chip.addEventListener('click', () => {
-    chatInput.value = chip.dataset.prompt;
-    chatInput.focus();
-  });
-});
-
 // Main autofill flow
 $('btn-send').addEventListener('click', handleAutofill);
 chatInput.addEventListener('keydown', e => {
@@ -313,15 +530,20 @@ chatInput.addEventListener('keydown', e => {
   }
 });
 
-function setAutofillLoading(isLoading, message = 'Autofill in progress…') {
+function setAutofillLoading(isLoading, activeId = 'scan', detail = '') {
   const loader = $('autofill-loader');
   const sendBtn = $('btn-send');
   const input = $('chat-input');
   const clearBtn = $('btn-clear');
   if (loader) {
     loader.classList.toggle('hidden', !isLoading);
-    const textEl = $('autofill-loader-text');
-    if (textEl) textEl.textContent = message;
+    if (isLoading) {
+      setAutofillProgress(activeId, detail);
+    } else {
+      renderAutofillSteps([]);
+      const textEl = $('autofill-loader-text');
+      if (textEl) textEl.textContent = 'Autofill in progress…';
+    }
   }
   if (sendBtn) {
     sendBtn.disabled = isLoading;
@@ -335,12 +557,22 @@ async function handleAutofill() {
   const instruction = chatInput.value.trim();
   if (!instruction) return;
 
-  setAutofillLoading(true, 'Scanning form fields...');
+  const treeId = getSelectedTreeId();
+  if (!treeId) {
+    appendMessage('assistant', '<p class="warn">Create a family tree first (Sync Vault → Family Tree tab).</p>');
+    return;
+  }
+
+  const tree = familyTrees.find((t) => t.id === treeId);
+  const treeLabel = tree ? tree.name : 'selected tree';
+
+  setAutofillLoading(true, 'scan');
+  await setPageOverlay(true, { steps: buildAutofillSteps('scan') });
   appendMessage('user', `<p>${escapeHtml(instruction)}</p>`);
   chatInput.value = '';
 
   const thinkingId = 'thinking_' + Date.now();
-  appendMessage('assistant', `<p id="${thinkingId}" class="thinking">Scanning form fields...</p>`);
+  appendMessage('assistant', `<p id="${thinkingId}" class="thinking">Scanning form fields on this page…</p>`);
 
   const autofillTask = (async () => {
     // Step 1: Scrape DOM, retry a couple of times for late-loading forms
@@ -352,6 +584,7 @@ async function handleAutofill() {
     }
     if (!domResponse?.fields?.length) {
       setAutofillLoading(false);
+      await setPageOverlay(false);
       const message = domResponse?.error
         ? `Form scanning failed: ${escapeHtml(domResponse.error)}`
         : 'No fillable form fields found on this page after retrying.';
@@ -360,7 +593,9 @@ async function handleAutofill() {
       return;
     }
 
-    document.getElementById(thinkingId).textContent = `Found ${domResponse.fields.length} fields. Mapping to vault...`;
+    document.getElementById(thinkingId).textContent = `Found ${domResponse.fields.length} fields on this page.`;
+    const fileCount = domResponse.fields.filter((f) => (f.type || '').toLowerCase() === 'file').length;
+    setAutofillProgress('vault', `Loading "${treeLabel}" profile data from vault database`, { includeFiles: fileCount > 0 });
 
     // Step 2: Get mapping from backend
     const token = await getValidToken();
@@ -369,6 +604,12 @@ async function handleAutofill() {
       showScreen('login');
       return;
     }
+
+    const mapDetail = fileCount
+      ? `Extracting values for ${domResponse.fields.length} fields (${fileCount} file upload${fileCount !== 1 ? 's' : ''})`
+      : `Extracting values for ${domResponse.fields.length} fields from vault`;
+    setAutofillProgress('map', mapDetail, { includeFiles: fileCount > 0 });
+    document.getElementById(thinkingId).textContent = `Matching form fields to vault data (${treeLabel})…`;
 
     const backendUrl = getBackendUrl();
     let mapRes;
@@ -383,7 +624,7 @@ async function handleAutofill() {
             Authorization: `Bearer ${token}`,
           },
           signal: controller.signal,
-          body: JSON.stringify({ userInstruction: instruction, domSchema: domResponse.fields }),
+          body: JSON.stringify({ userInstruction: instruction, domSchema: domResponse.fields, treeId }),
         });
       } finally {
         clearTimeout(timeoutId);
@@ -422,6 +663,17 @@ async function handleAutofill() {
     const valueMappings = normalized.filter((m) => m.fieldType !== 'file' && m.value !== null && m.value !== undefined && m.value !== '');
     const fileMappings = normalized.filter((m) => m.fieldType === 'file');
 
+    const mappedCount = mapData.summary?.mapped ?? normalized.filter((m) => (m.value !== null && m.value !== undefined && m.value !== '') || m.fileUrl).length;
+    const total = mapData.summary?.total ?? normalized.length;
+
+    setAutofillProgress('map', `Matched ${mappedCount} of ${total} fields from vault`, { includeFiles: fileMappings.length > 0 });
+
+    const fillDetail = valueMappings.length
+      ? `Injecting ${valueMappings.length} value${valueMappings.length !== 1 ? 's' : ''} into form`
+      : 'No text fields to fill';
+    setAutofillProgress('fill', fillDetail, { includeFiles: fileMappings.length > 0 });
+    document.getElementById(thinkingId).textContent = `Filling ${valueMappings.length} field${valueMappings.length !== 1 ? 's' : ''} on the page…`;
+
     const injectRes = await withTimeout(
       sendChromeMessage({ type: 'INJECT_VALUES', mappings: valueMappings }),
       180000,
@@ -429,19 +681,25 @@ async function handleAutofill() {
     );
 
     const fileInjectRes = fileMappings.length > 0
-      ? await withTimeout(
-        sendChromeMessage({ type: 'INJECT_FILES', mappings: fileMappings }),
-        180000,
-        'File injection timed out'
-      )
+      ? await (async () => {
+        const names = fileMappings.map((m) => m.fileName || m.fieldLabel || 'document').join(', ');
+        setAutofillProgress('files', `Getting file${fileMappings.length !== 1 ? 's' : ''} from vault: ${names}`);
+        document.getElementById(thinkingId).textContent = `Attaching ${fileMappings.length} document${fileMappings.length !== 1 ? 's' : ''} from vault…`;
+        return withTimeout(
+          sendChromeMessage({ type: 'INJECT_FILES', mappings: fileMappings }),
+          180000,
+          'File injection timed out'
+        );
+      })()
       : { injected: 0, failed: 0, details: [] };
+
+    await setPageOverlay(false);
 
     const injected = (injectRes?.injected ?? 0) + (fileInjectRes?.injected ?? 0);
     const failedInjects = (injectRes?.failed ?? 0) + (fileInjectRes?.failed ?? 0);
-    const mappedCount = mapData.summary?.mapped ?? normalized.filter((m) => (m.value !== null && m.value !== undefined && m.value !== '') || m.fileUrl).length;
-    const total = mapData.summary?.total ?? normalized.length;
 
-    let summaryHtml = `<p>Mapped <strong>${mappedCount}</strong> of ${total} candidate fields.</p>`;
+    let summaryHtml = `<p>Using family tree: <strong>${escapeHtml(mapData.treeName || treeLabel)}</strong></p>`;
+    summaryHtml += `<p>Mapped <strong>${mappedCount}</strong> of ${total} candidate fields.</p>`;
     summaryHtml += `<p>Injected <strong>${injected}</strong> values into the page.</p>`;
     if (failedInjects > 0) {
       summaryHtml += `<p class="warn">${failedInjects} field${failedInjects !== 1 ? 's' : ''} failed to inject and need manual review.</p>`;
@@ -469,6 +727,8 @@ async function handleAutofill() {
     if (el) el.outerHTML = `<div class="message assistant"><p class="error">Error: ${escapeHtml(errMsg)}</p></div>`;
   } finally {
     setAutofillLoading(false);
+    renderAutofillSteps([]);
+    await setPageOverlay(false);
   }
 }
 

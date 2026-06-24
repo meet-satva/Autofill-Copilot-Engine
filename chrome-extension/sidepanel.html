@@ -26,6 +26,13 @@
     <!-- Main Chat Screen -->
     <div id="main-screen" class="screen hidden">
 
+      <!-- Family tree selector -->
+      <div class="tree-bar">
+        <label for="tree-select">Family tree</label>
+        <select id="tree-select" class="tree-select"></select>
+        <button id="btn-new-tree" class="btn-ghost btn-sm" type="button">+ New</button>
+      </div>
+
       <!-- Sync Vault Panel -->
       <div class="sync-panel">
         <button class="sync-toggle" id="btn-sync-toggle">
@@ -36,12 +43,26 @@
 
           <!-- Tab buttons -->
           <div class="sync-tabs">
-            <button class="sync-tab active" id="tab-seed" data-tab="seed">✍️ Quick Seed</button>
+            <button class="sync-tab active" id="tab-family" data-tab="family">👨‍👩‍👧 Family Tree</button>
+            <button class="sync-tab" id="tab-seed" data-tab="seed">✍️ Quick Seed</button>
             <button class="sync-tab" id="tab-drive" data-tab="drive">📂 Google Drive</button>
           </div>
 
+          <!-- Family Tree Wizard -->
+          <div id="panel-family">
+            <p class="sync-hint">Build your family tree. Documents from Drive will be matched to these members.</p>
+            <input type="text" id="tree-name" class="sync-input" placeholder="Tree name (e.g. Prajapati Family)" />
+            <input type="text" id="member-primary" class="sync-input" placeholder="Primary user (you) *" />
+            <input type="text" id="member-spouse" class="sync-input" placeholder="Spouse / wife name" />
+            <input type="text" id="member-father" class="sync-input" placeholder="Father name" />
+            <input type="text" id="member-mother" class="sync-input" placeholder="Mother name" />
+            <input type="text" id="member-children" class="sync-input" placeholder="Children names (comma-separated)" />
+            <button id="btn-save-tree" class="btn-sync">Save Family Tree ✓</button>
+            <div id="tree-status" class="sync-status-msg"></div>
+          </div>
+
           <!-- Quick Seed Panel -->
-          <div id="panel-seed">
+          <div id="panel-seed" class="hidden">
             <p class="sync-hint">Paste your Aadhaar / identity data below and we'll populate your vault instantly.</p>
             <textarea id="seed-data" class="sync-textarea" placeholder='Paste raw identity text (e.g. Aadhaar card text, any format)...' rows="5"></textarea>
             <button id="btn-seed" class="btn-sync">Seed Vault ✓</button>
@@ -77,15 +98,15 @@
         </div>
         <div id="autofill-loader" class="autofill-loader hidden">
           <span class="loader-dot"></span>
-          <span id="autofill-loader-text">Autofill in progress…</span>
+          <div class="autofill-loader-body">
+            <span id="autofill-loader-text">Autofill in progress…</span>
+            <ul id="autofill-steps" class="autofill-steps"></ul>
+          </div>
         </div>
       </div>
 
-      <div class="quick-prompts">
+      <div class="quick-prompts" id="quick-prompts">
         <span class="label">Quick:</span>
-        <button class="chip" data-prompt="Fill this form for Chintan">Chintan</button>
-        <button class="chip" data-prompt="Fill this form for my wife Manisha">Manisha</button>
-        <button class="chip" data-prompt="Fill this form for my daughter Dhyana">Dhyana</button>
       </div>
     </div>
   </div>

@@ -1,3 +1,5 @@
+importScripts('config.js');
+
 chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ windowId: tab.windowId });
 });
@@ -17,100 +19,92 @@ function tryParseJson(text) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'SCRAPE_DOM') {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tab = tabs[0];
-      if (!tab) return sendResponse({ error: 'No active tab' });
-      // Chrome internal pages cannot be accessed
-      const url = tab.url || tab.pendingUrl || '';
-      if (!url || url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('about:')) {
-        console.warn('Skipping injection on restricted URL:', url);
-        return sendResponse({ error: 'Cannot access this type of page (e.g. Chrome internal pages or extensions)' });
+function isRestrictedUrl(url) {
+  return !url || url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('about:');
+}
+
+function forwardToActiveTab(message, sendResponse) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    if (!tab?.id) return sendResponse({ error: 'No active tab' });
+    const url = tab.url || tab.pendingUrl || '';
+    if (isRestrictedUrl(url)) {
+      return sendResponse({ error: 'Cannot access this type of page' });
+    }
+    chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] }, () => {
+      if (chrome.runtime.lastError) {
+        return sendResponse({ error: 'Injection failed' });
       }
-      const tabId = tab.id;
-      // Ensure content script is loaded
-      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }, () => {
+      chrome.tabs.sendMessage(tab.id, message, (response) => {
         if (chrome.runtime.lastError) {
-          console.error('Injection error:', chrome.runtime.lastError);
-          return sendResponse({ error: 'Injection failed' });
+          return sendResponse({ error: chrome.runtime.lastError.message });
         }
-        chrome.tabs.sendMessage(tabId, { type: 'SCRAPE_DOM' }, (response) => {
-          if (chrome.runtime.lastError) {
-            console.error('Message error:', chrome.runtime.lastError);
-            return sendResponse({ error: 'No receiving end' });
-          }
-          sendResponse(response);
-        });
+        sendResponse(response);
       });
     });
-    return true; 
+  });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'SCRAPE_DOM') {
+    forwardToActiveTab({ type: 'SCRAPE_DOM' }, sendResponse);
+    return true;
   }
 
-   if (message.type === 'FETCH_FILE_BLOB') {
+  if (message.type === 'SHOW_AUTOFILL_OVERLAY' || message.type === 'UPDATE_AUTOFILL_OVERLAY' || message.type === 'HIDE_AUTOFILL_OVERLAY') {
+    forwardToActiveTab(message, sendResponse);
+    return true;
+  }
+
+  if (message.type === 'FETCH_FILE_BLOB') {
     fetch(message.url)
       .then(res => res.arrayBuffer())
       .then(buffer => sendResponse({ buffer }))
       .catch(err => sendResponse({ error: err.message }));
-    return true;   
+    return true;
   }
 
   if (message.type === 'INJECT_VALUES') {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tab = tabs[0];
-      if (!tab) return sendResponse({ error: 'No active tab' });
-      const url = tab.url || tab.pendingUrl || '';
-      if (!url || url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('about:')) {
-        console.warn('Skipping injection on restricted URL:', url);
-        return sendResponse({ error: 'Cannot access this type of page (e.g. Chrome internal pages or extensions)' });
-      }
-      const tabId = tab.id;
-      // Ensure content script is loaded before injection
-      chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }, () => {
-        if (chrome.runtime.lastError) {
-          console.error('Injection error:', chrome.runtime.lastError);
-          return sendResponse({ error: 'Injection failed' });
-        }
-        chrome.tabs.sendMessage(tabId, { type: 'INJECT_VALUES', mappings: message.mappings }, (response) => {
-          if (chrome.runtime.lastError) {
-            console.error('Message error:', chrome.runtime.lastError);
-            return sendResponse({ error: 'No receiving end' });
-          }
-          sendResponse(response);
-        });
-      });
-    });
+    forwardToActiveTab({ type: 'INJECT_VALUES', mappings: message.mappings }, sendResponse);
+    return true;
+  }
+
+  if (message.type === 'INJECT_FILES') {
+    forwardToActiveTab({ type: 'INJECT_FILES', mappings: message.mappings }, sendResponse);
     return true;
   }
 
   if (message.type === 'DETECT_FIELDS_WITH_AI') {
-    const apiKey = "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";
-    const body = {
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      temperature: 0,
-      messages: [{
-        role: 'user',
-        content: `You are a form‑field extractor. Return a JSON array of objects for every fillable form field in the following HTML. Include the properties: id, name, type, label (text), placeholder, ariaLabel, ariaDescribedBy. Exclude hidden, button, submit, reset inputs.\n\nHTML:\n${message.html}`,
-      }],
-    };
+    const apiKey = typeof OPENROUTER_API_KEY !== 'undefined' ? OPENROUTER_API_KEY : '';
+    const model = typeof OPENROUTER_MODEL !== 'undefined' ? OPENROUTER_MODEL : 'anthropic/claude-sonnet-4';
+    if (!apiKey) {
+      console.error('OPENROUTER_API_KEY not set — copy config.example.js to config.js');
+      sendResponse([]);
+      return true;
+    }
 
-    fetch('https://api.anthropic.com/v1/messages', {
+    fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        accept: 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model,
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [{
+          role: 'user',
+          content: `You are a form-field extractor. Return a JSON array of objects for every fillable form field in the following HTML. Include the properties: id, name, type, label (text), placeholder, ariaLabel, ariaDescribedBy. Exclude hidden, button, submit, reset inputs.\n\nHTML:\n${message.html}`,
+        }],
+      }),
     })
       .then(resp => {
-        if (!resp.ok) throw new Error(`Anthropic error ${resp.status}`);
+        if (!resp.ok) throw new Error(`OpenRouter error ${resp.status}`);
         return resp.json();
       })
       .then(data => {
-        const text = data.content?.[0]?.text || '';
+        const text = data.choices?.[0]?.message?.content || '';
         const parsed = tryParseJson(text);
         sendResponse(Array.isArray(parsed) ? parsed : []);
       })
@@ -119,6 +113,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse([]);
       });
 
-    return true; // Keep message channel open for async fetch
+    return true;
   }
 });

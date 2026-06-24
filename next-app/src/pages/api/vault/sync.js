@@ -1,14 +1,19 @@
 
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { verifyToken } from '../auth/verify.js';
-import { createSyncJob, updateSyncJob, addIngestionFailure, addArchivedDocument, setVault } from '../../../db.js';
+import { createSyncJob, updateSyncJob, addIngestionFailure, addArchivedDocument, setVault, getVault } from '../../../db.js';
 import { extractFolderId, listAllFiles, getDriveClient } from '../../../lib/driveClient.js';
-import { deepEncryptObject } from "../../../lib/encryptionUtils.js";
+import { deepEncryptObject, deepDecryptObject } from "../../../lib/encryptionUtils.js";
 import { PDFParse } from 'pdf-parse';
 import sharp from 'sharp';
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
+import { parseDocumentWithVision } from '../../../lib/openRouterClient.js';
+import {
+  migrateLegacyVault,
+  resolveTreeVault,
+  buildAssignCandidates,
+  matchNameToProfileKey,
+  isGenericFolderName,
+  extractPersonNameFromPath,
+} from '../../../lib/familyTreeUtils.js';
 const PARSE_PROMPTS = {
   aadhaar: `Extract from this Aadhaar card. Return ONLY valid JSON:
 {
@@ -17,7 +22,8 @@ const PARSE_PROMPTS = {
   "gender": "Male|Female|Other",
   "aadhaarNumber": "XXXX XXXX XXXX",
   "address": "full address",
-  "pincode": "6 digit or null"
+  "pincode": "6 digit PIN/ZIP from address or null",
+  "email": "if visible or null"
 }`,
 
   pan: `Extract from PAN card. Return ONLY valid JSON:
@@ -73,12 +79,44 @@ const PARSE_PROMPTS = {
   "marketValue": "or null"
 }`,
 
-  unknown: `Extract all readable information. Return ONLY valid JSON:
+  unknown: `You are an expert document parser. Extract ALL readable information from this document regardless of type (identity card, certificate, bank document, utility bill, government form, resume, contact list, etc.).
+Return ONLY valid JSON with every field you can find. Use null for missing values.
 {
-  "documentType": "best guess",
-  "name": "or null",
-  "dob": "or null",
-  "idNumber": "or null",
+  "documentType": "your best guess",
+  "name": "full name or null",
+  "fatherName": "or null",
+  "motherName": "or null",
+  "spouseName": "or null",
+  "dob": "DD/MM/YYYY or null",
+  "gender": "Male|Female|Other or null",
+  "idNumber": "primary ID/reference number or null",
+  "aadhaarNumber": "or null",
+  "panNumber": "or null",
+  "passportNumber": "or null",
+  "address": "full address or null",
+  "pincode": "6-digit PIN/ZIP or null",
+  "phone": "or null",
+  "phoneNumber": "or null",
+  "email": "email address if visible or null",
+  "businessName": "company/business name or null",
+  "website": "website URL or null",
+  "dateOfIssue": "or null",
+  "dateOfExpiry": "or null",
+  "otherDetails": {}
+}`,
+
+  contact_info: `Parse this contact/business details text. The input may be key:value lines (e.g. email: x@y.com, BusinessName: Acme).
+Return ONLY valid JSON. Extract every field present:
+{
+  "documentType": "contact_info",
+  "name": "person name or null",
+  "email": "email or null",
+  "phone": "phone/mobile or null",
+  "phoneNumber": "same as phone or null",
+  "businessName": "business/company name or null",
+  "website": "website URL or null",
+  "address": "address or null",
+  "pincode": "6-digit PIN/ZIP or null",
   "otherDetails": {}
 }`,
 };
@@ -128,7 +166,7 @@ function shouldFallbackToImageOcr(text, documentType = '', fileName = '') {
   return /^[\W_]*$/.test(normalized) || !/[0-9]/.test(normalized) && normalized.split(' ').length <= 4;
 }
 
-async function renderPdfPagesAsImages(pdfBuffer, maxPages = 2) {
+async function renderPdfPagesAsImages(pdfBuffer, maxPages = 4) {
   try {
     const metadata = await sharp(pdfBuffer, { density: 300 }).metadata();
     const pageCount = Math.max(1, metadata.pages || 1);
@@ -161,6 +199,148 @@ function extractTxtText(buffer) {
     console.warn(`    ⚠️  Text extraction failed: ${err.message}`);
   }
   return null;
+}
+
+const KV_FIELD_MAP = {
+  email: 'email',
+  mail: 'email',
+  emailaddress: 'email',
+  phonenumber: 'phone',
+  phone: 'phone',
+  mobile: 'phone',
+  mobilenumber: 'phone',
+  tel: 'phone',
+  telephone: 'phone',
+  businessname: 'businessName',
+  business: 'businessName',
+  company: 'businessName',
+  companyname: 'businessName',
+  organisation: 'businessName',
+  organization: 'businessName',
+  website: 'website',
+  url: 'website',
+  site: 'website',
+  pincode: 'pincode',
+  pin: 'pincode',
+  zip: 'pincode',
+  zipcode: 'pincode',
+  postalcode: 'pincode',
+  name: 'name',
+  fullname: 'name',
+  address: 'address',
+  dob: 'dob',
+  dateofbirth: 'dob',
+};
+
+function normalizeKvKey(key) {
+  return (key || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Fast local parser for key:value text files — no LLM needed */
+export function parseKeyValueText(text) {
+  const result = { documentType: 'contact_info', otherDetails: {} };
+  if (!text?.trim()) return result;
+
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^([^:]+):\s*(.+)$/);
+    if (!match) continue;
+    const rawKey = match[1].trim();
+    const value = match[2].trim();
+    if (!value) continue;
+
+    const mapped = KV_FIELD_MAP[normalizeKvKey(rawKey)];
+    if (mapped === 'pincode') {
+      const digits = value.replace(/\D/g, '');
+      result.pincode = digits.length >= 6 ? digits.slice(-6) : digits;
+    } else if (mapped) {
+      result[mapped] = value;
+    } else {
+      result.otherDetails[rawKey] = value;
+    }
+  }
+
+  if (result.phone && !result.phoneNumber) result.phoneNumber = result.phone;
+  if (result.phoneNumber && !result.phone) result.phone = result.phoneNumber;
+
+  const emailInText = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  if (!result.email && emailInText) result.email = emailInText[0];
+
+  if (!result.pincode && result.address) {
+    const pinMatch = result.address.match(/\b(\d{6})\b/);
+    if (pinMatch) result.pincode = pinMatch[1];
+  }
+
+  return result;
+}
+
+function countParsedFields(data) {
+  if (!data || typeof data !== 'object') return 0;
+  return Object.entries(data).filter(([k, v]) => {
+    if (k === 'otherDetails') {
+      return v && typeof v === 'object' && Object.keys(v).length > 0;
+    }
+    return v !== null && v !== undefined && v !== '';
+  }).length;
+}
+
+function enrichParsedData(parsed, rawText = '') {
+  const out = {
+    ...parsed,
+    otherDetails: { ...(parsed?.otherDetails && typeof parsed.otherDetails === 'object' ? parsed.otherDetails : {}) },
+  };
+
+  const kv = rawText ? parseKeyValueText(rawText) : {};
+  for (const [key, value] of Object.entries(kv)) {
+    if (key === 'otherDetails') {
+      Object.assign(out.otherDetails, value);
+      continue;
+    }
+    if (value && (out[key] === null || out[key] === undefined || out[key] === '')) {
+      out[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(out.otherDetails)) {
+    const mapped = KV_FIELD_MAP[normalizeKvKey(key)];
+    if (mapped && value && !out[mapped]) {
+      out[mapped] = mapped === 'pincode' ? String(value).replace(/\D/g, '').slice(-6) : value;
+    }
+  }
+
+  if (!out.phone && out.phoneNumber) out.phone = out.phoneNumber;
+  if (!out.phoneNumber && out.phone) out.phoneNumber = out.phone;
+  if (!out.pincode && out.address) {
+    const pinMatch = out.address.match(/\b(\d{6})\b/);
+    if (pinMatch) out.pincode = pinMatch[1];
+  }
+
+  return out;
+}
+
+function hasUsefulParsedData(parsed) {
+  if (!parsed || parsed.error) return false;
+  const keys = ['name', 'email', 'phone', 'phoneNumber', 'businessName', 'website', 'address', 'pincode', 'aadhaarNumber', 'panNumber', 'dob'];
+  return keys.some((k) => parsed[k]) || (parsed.otherDetails && Object.keys(parsed.otherDetails).length > 0);
+}
+
+function resolveProfileForDocument(doc, cleanParsed, familyTree) {
+  if (doc.matchedRole) return doc.matchedRole;
+
+  const sourceName = resolveSourceName(cleanParsed, doc);
+  let profileKey = sourceName
+    ? assignProfileOwner({ ...cleanParsed, name: sourceName }, familyTree)
+    : assignProfileOwner(cleanParsed, familyTree);
+
+  if (profileKey !== 'unknown') return profileKey;
+
+  const folderGeneric = !doc.personName || doc.personName === 'unknown' || isGenericFolderName(doc.personName);
+  if (folderGeneric && hasUsefulParsedData(cleanParsed) && familyTree?.primary) {
+    console.log(`    ↪ Assigning to primary (${familyTree.primary}) — generic folder with contact/identity data`);
+    return 'primary';
+  }
+
+  return 'unknown';
 }
 
 // Fetch Drive file as base64
@@ -287,7 +467,20 @@ export async function parseDocumentGroup(group) {
             textParts.push(`[${file.name}]:\n${text}`);
           }
         } else {
-          console.warn(`    ⚠️  Unsupported: ${file.name} (${fetched.mimeType})`);
+          console.warn(`    ⚠️  Trying image conversion for: ${file.name} (${fetched.mimeType})`);
+          try {
+            const rawBuffer = Buffer.from(fetched.base64, 'base64');
+            const imgBuffer = await sharp(rawBuffer).jpeg({ quality: 90 }).resize({ width: 1600, withoutEnlargement: true }).toBuffer();
+            imageFiles.push({
+              name: file.name,
+              mimeType: 'image/jpeg',
+              base64: imgBuffer.toString('base64'),
+              isImage: true,
+            });
+            console.log(`    ✅ Converted to image: ${file.name}`);
+          } catch {
+            console.warn(`    ⚠️  Unsupported: ${file.name} (${fetched.mimeType})`);
+          }
         }
       } catch (err) {
         console.error(`    ❌ Fetch failed ${file.name}:`, err.message);
@@ -301,46 +494,54 @@ export async function parseDocumentGroup(group) {
 
     console.log(`    📤 Sending: ${imageFiles.length} images + ${textParts.length} text sources`);
 
-    // ✅ Build Gemini request
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    const combinedText = textParts.join('\n');
+    const isTextOnly = imageFiles.length === 0 && textParts.length > 0;
+    const kvParsed = isTextOnly ? parseKeyValueText(combinedText) : null;
+    const kvFieldCount = kvParsed ? countParsedFields(kvParsed) : 0;
 
-    const content = [
-      {
-        text: PARSE_PROMPTS[documentType] || PARSE_PROMPTS['unknown'],
-      },
-      // Add all images
-      ...imageFiles.map(file => ({
-        inlineData: {
-          mimeType: file.mimeType,
-          data: file.base64,
-        },
-      })),
-      // Add extracted text
-      ...(textParts.length > 0
-        ? [
-          {
-            text: `\n\n--- Additional extracted text content ---\n${textParts.join('\n\n')}`,
-          },
-        ]
-        : []),
-    ];
+    if (isTextOnly && kvFieldCount >= 1) {
+      console.log(`    ⚡ Key-value text parsed locally (${kvFieldCount} fields) — skipping LLM`);
+      return enrichParsedData(kvParsed, combinedText);
+    }
 
-    const response = await model.generateContent(content);
-    const rawText = response.response.text();
+    const effectiveType = documentType === 'unknown' && isTextOnly && kvFieldCount >= 1
+      ? 'contact_info'
+      : documentType;
+
+    const prompt = effectiveType === 'unknown'
+      ? PARSE_PROMPTS.unknown
+      : effectiveType === 'contact_info'
+        ? PARSE_PROMPTS.contact_info
+        : `${PARSE_PROMPTS[effectiveType] || PARSE_PROMPTS.unknown}\n\nAlso extract spouseName, fatherName, motherName, email, phone, businessName, website, pincode if visible.`;
+
+    const rawText = await parseDocumentWithVision({
+      prompt,
+      imageFiles,
+      textParts,
+    });
 
     console.log(`    📝 Response: ${rawText.slice(0, 200)}`);
 
     const clean = rawText.replace(/```json|```/gi, '').trim();
     if (!clean) {
+      if (kvParsed && kvFieldCount >= 1) {
+        return enrichParsedData(kvParsed, combinedText);
+      }
       return { error: 'EMPTY_RESPONSE', message: 'Model returned empty' };
     }
 
     try {
-      return JSON.parse(clean);
+      const parsed = JSON.parse(clean);
+      return enrichParsedData(parsed, combinedText);
     } catch {
       const jsonMatch = clean.match(/(\{[\s\S]*\})/);
       if (jsonMatch) {
-        return JSON.parse(jsonMatch[1]);
+        const parsed = JSON.parse(jsonMatch[1]);
+        return enrichParsedData(parsed, combinedText);
+      }
+      if (kvParsed && kvFieldCount >= 1) {
+        console.log(`    ⚡ LLM parse failed — using key-value fallback`);
+        return enrichParsedData(kvParsed, combinedText);
       }
       return { error: 'JSON_PARSE_ERROR', message: clean.slice(0, 100) };
     }
@@ -352,6 +553,20 @@ export async function parseDocumentGroup(group) {
 }
 
 // Assign to profile
+function resolveSourceName(parsedData, doc) {
+  for (const n of [parsedData?.name, doc?.personName]) {
+    if (n && !isGenericFolderName(n)) return n;
+  }
+  return '';
+}
+
+function sanitizeParsedData(parsedData) {
+  if (!parsedData || typeof parsedData !== 'object') return {};
+  const out = { ...parsedData };
+  if (isGenericFolderName(out.name)) delete out.name;
+  return out;
+}
+
 export function assignProfileOwner(parsedData, familyTree) {
   const norm = (str) =>
     (str || '')
@@ -385,24 +600,17 @@ export function assignProfileOwner(parsedData, familyTree) {
   };
 
   const extractedName = norm(parsedData.name || '');
-  if (!extractedName) {
-    console.warn('    ⚠️  No name in parsed data');
+  if (!extractedName || isGenericFolderName(extractedName)) {
+    console.warn('    ⚠️  No valid person name in parsed data');
     return 'unknown';
   }
 
-  const candidates = [
-    { profileKey: 'primary', names: [norm(familyTree.primary)] },
-    { profileKey: 'spouse', names: [norm(familyTree.spouse)] },
-    { profileKey: 'mother', names: [norm(familyTree.mother)] },
-    ...(familyTree.children || []).map((child, idx) => ({
-      profileKey: `children_${idx}`,
-      names: [norm(child)],
-    })),
-  ];
+  const candidates = buildAssignCandidates(familyTree);
 
   // Exact match
   for (const candidate of candidates) {
-    if (candidate.names.some(n => n === extractedName)) {
+    const normalizedNames = candidate.names.map((n) => norm(n));
+    if (normalizedNames.some((n) => n === extractedName)) {
       console.log(`    ✅ Exact match → ${candidate.profileKey}`);
       return candidate.profileKey;
     }
@@ -410,7 +618,8 @@ export function assignProfileOwner(parsedData, familyTree) {
 
   // Fuzzy alias match, useful for files/folders that omit the last letter or use nickname variants.
   for (const candidate of candidates) {
-    if (candidate.names.some(n => aliasMatches(n, extractedName))) {
+    const normalizedNames = candidate.names.map((n) => norm(n));
+    if (normalizedNames.some((n) => aliasMatches(n, extractedName))) {
       console.log(`    ✅ Alias match → ${candidate.profileKey}`);
       return candidate.profileKey;
     }
@@ -474,12 +683,20 @@ export function assignProfileOwner(parsedData, familyTree) {
 
 function detectDocumentType(fileName) {
   const name = fileName.toLowerCase();
-  if (name.includes('aadhaar') || name.includes('aadhar')) return 'aadhaar';
+  if (name.includes('aadhaar') || name.includes('aadhar') || name.includes('uid')) return 'aadhaar';
   if (name.includes('pan')) return 'pan';
   if (name.includes('passport')) return 'passport';
-  if (name.includes('driving') || name.includes('licence') || name.includes('license')) return 'driving_licence';
-  if (name.includes('voter')) return 'voter_id';
-  if (name.includes('land') || name.includes('deed') || name.includes('property')) return 'land_deed';
+  if (name.includes('driving') || name.includes('licence') || name.includes('license') || name.includes('dl_')) return 'driving_licence';
+  if (name.includes('voter') || name.includes('epic')) return 'voter_id';
+  if (name.includes('land') || name.includes('deed') || name.includes('property') || name.includes('sale deed')) return 'land_deed';
+  if (name.includes('birth')) return 'unknown';
+  if (name.includes('ration')) return 'unknown';
+  if (name.includes('bank') || name.includes('passbook') || name.includes('statement')) return 'unknown';
+  if (name.includes('resume') || name.includes('cv')) return 'unknown';
+  if (name.includes('bill') || name.includes('invoice') || name.includes('receipt')) return 'unknown';
+  if (name.includes('certificate') || name.includes('cert')) return 'unknown';
+  if (name.includes('other') || name.includes('contact') || name.includes('detail') || name.includes('info')) return 'contact_info';
+  if (name.endsWith('.txt')) return 'contact_info';
   return 'unknown';
 }
 
@@ -492,21 +709,8 @@ function groupDocumentsByFolderStructure(allFilesWithPaths) {
     if (file.mimeType === 'application/vnd.google-apps.folder') continue;
 
     const pathParts = folderPath.split('/').filter(p => p);
-    let personName = 'unknown';
-
-    const proofsFolderIdx = pathParts.findIndex(p =>
-      p.toLowerCase().includes('identity_proofs') || p.toLowerCase().includes('identity proofs')
-    );
-
-    if (proofsFolderIdx !== -1 && proofsFolderIdx + 1 < pathParts.length) {
-      personName = pathParts[proofsFolderIdx + 1]
-        .toLowerCase().replace(/[_-]/g, ' ').trim();
-    } else if (pathParts.length >= 2) {
-      const parentName = pathParts[pathParts.length - 2];
-      if (!parentName.match(/^\d+$/) && parentName.length > 2) {
-        personName = parentName.toLowerCase().replace(/[_-]/g, ' ').trim();
-      }
-    }
+    const extracted = extractPersonNameFromPath(pathParts);
+    const personName = extracted !== 'unknown' && !isGenericFolderName(extracted) ? extracted : 'unknown';
 
     // Detect doc type from filename, then parent folder
     const documentType = detectDocumentType(file.name) || detectDocumentType(pathParts[pathParts.length - 2]) || 'unknown';
@@ -529,7 +733,7 @@ function groupDocumentsByFolderStructure(allFilesWithPaths) {
   return groupArray;
 }
 
-export async function runSyncJob(jobId, folderUrl, userId) {
+export async function runSyncJob(jobId, folderUrl, userId, treeId) {
   console.log(`\n${'='.repeat(80)}`);
   console.log(`🚀 Sync Job: ${jobId}`);
   console.log(`${'='.repeat(80)}\n`);
@@ -555,9 +759,44 @@ export async function runSyncJob(jobId, folderUrl, userId) {
 
   await updateSyncJob(jobId, { progress: { total: allFilesWithPaths.length, processed: 0, failed: 0 } });
 
+  let rootVault = await getVault(userId);
+  rootVault = migrateLegacyVault(rootVault);
+  const treeCtx = resolveTreeVault(rootVault, treeId);
+  if (!treeCtx) {
+    await updateSyncJob(jobId, { status: 'failed', error: 'Family tree not found. Create a family tree first.' });
+    return;
+  }
+
+  const vaultData = {
+    ownerId: userId,
+    lastSynced: new Date().toISOString(),
+    familyTree: { ...treeCtx.tree.familyTree },
+    profiles: deepDecryptObject(treeCtx.tree.profiles || {}),
+    assets: deepDecryptObject(treeCtx.tree.assets || {}),
+  };
+
+  for (const { profileKey } of buildAssignCandidates(vaultData.familyTree)) {
+    if (!vaultData.profiles[profileKey]) {
+      vaultData.profiles[profileKey] = { personalDetails: {}, identities: {}, documents: [] };
+    }
+  }
+
   let groups;
   try {
     groups = groupDocumentsByFolderStructure(allFilesWithPaths);
+    groups = groups.map((g) => {
+      const role = matchNameToProfileKey(g.personName, vaultData.familyTree);
+      if (!role) return g;
+      const ft = vaultData.familyTree;
+      const canonical = {
+        primary: ft.primary,
+        spouse: ft.spouse,
+        grandfather: ft.grandfather,
+        grandmother: ft.grandmother,
+        ...(ft.children || []).reduce((acc, c, i) => ({ ...acc, [`children_${i}`]: c }), {}),
+      }[role];
+      return { ...g, personName: canonical || g.personName, matchedRole: role };
+    });
   } catch (err) {
     await updateSyncJob(jobId, { status: 'failed', error: `Failed to group: ${err.message}` });
     return;
@@ -568,30 +807,16 @@ export async function runSyncJob(jobId, folderUrl, userId) {
     return;
   }
 
-  const vaultData = {
-    ownerId: userId,
-    lastSynced: new Date().toISOString(),
-    familyTree: {
-      primary: 'Chintan Jayantibhai Prajapati',
-      spouse: 'Manisha Prajapati',
-      children: ['Dhyana Prajapati'],
-      mother: 'Geetaben',
-    },
-    profiles: {
-      primary: { personalDetails: {}, identities: {}, documents: [] },
-      spouse: { personalDetails: {}, identities: {}, documents: [] },
-      children_0: { personalDetails: {}, identities: {}, documents: [] },
-      mother: { personalDetails: {}, identities: {}, documents: [] },
-    },
-    assets: {},
-  };
-
   let processed = 0;
   let failed = 0;
 
   const allParsedDocuments = [];
 
   for (const group of groups) {
+    const folderRole = matchNameToProfileKey(group.personName, vaultData.familyTree);
+    if (folderRole) {
+      console.log(`  📁 Folder "${group.personName}" → tree role: ${folderRole}`);
+    }
     console.log(`\n  📄 Parsing group: "${group.personName}" - ${group.documentType} (${group.files.length} file(s))`);
     const parsed = await parseDocumentGroup(group);
 
@@ -611,7 +836,7 @@ export async function runSyncJob(jobId, folderUrl, userId) {
         ...group,
         parsedData: {
           documentType: group.documentType !== 'unknown' ? group.documentType : 'unknown',
-          name: group.personName !== 'unknown' ? group.personName : null,
+          name: group.personName !== 'unknown' && !isGenericFolderName(group.personName) ? group.personName : null,
           parseError: parsed.error,
         },
       });
@@ -638,40 +863,13 @@ export async function runSyncJob(jobId, folderUrl, userId) {
       continue;
     }
 
-    const sourceName = parsedData.name || doc.personName || '';
-    const profileKey = sourceName
-      ? assignProfileOwner({ ...parsedData, name: sourceName }, vaultData.familyTree)
-      : assignProfileOwner(parsedData, vaultData.familyTree);
-    console.log(`  👤 Assigned "${sourceName || 'unknown'}" → ${profileKey}`);
+    const cleanParsed = sanitizeParsedData(parsedData);
+    const profileKey = resolveProfileForDocument(doc, cleanParsed, vaultData.familyTree);
+    const sourceName = resolveSourceName(cleanParsed, doc);
+    console.log(`  👤 Assigned "${sourceName || cleanParsed.name || doc.personName || 'unknown'}" → ${profileKey}`);
 
     if (profileKey === 'unknown') {
-      console.warn(`  ⚠️  Falling back to folder owner for unknown profile owner`);
-      const fallbackKey = doc.personName
-        ? assignProfileOwner({ ...parsedData, name: doc.personName }, vaultData.familyTree)
-        : 'unknown';
-      if (fallbackKey !== 'unknown') {
-        if (vaultData.profiles[fallbackKey]) {
-          vaultData.profiles[fallbackKey].documents.push({
-            documentType,
-            ...parsedData,
-            name: sourceName || doc.personName || parsedData.name || null,
-            driveFileIds: doc.files.map(f => f.id),
-            driveFileNames: doc.files.map(f => f.name),
-          });
-        }
-        await addArchivedDocument({
-          userId,
-          documentType,
-          parsedData: deepEncryptObject(parsedData),
-          driveFileIds: doc.files.map(f => f.id),
-          driveFileNames: doc.files.map(f => f.name),
-          status: 'processed_folder_fallback',
-          determinedDate: null,
-          dateSource: null,
-        });
-        continue;
-      }
-      
+      console.warn(`  ⚠️  Could not match owner — archiving without profile assignment`);
       const links = doc.files
         .filter(f => f.mimeType !== 'text/plain' && !f.name.endsWith('.txt'))
         .map(f => f.webViewLink)
@@ -695,13 +893,21 @@ export async function runSyncJob(jobId, folderUrl, userId) {
       profilesAndDocs[profileKey] = {};
     }
     
-    // Prevent multiple unknown documents from overwriting each other by treating them as separate types
-    const uniqueType = documentType === 'unknown' ? `unknown_${doc.files[0].id}` : documentType;
+    // Separate buckets per file for contact/unknown docs so nothing overwrites
+    const uniqueType = (documentType === 'unknown' || documentType === 'contact_info')
+      ? `${documentType}_${doc.files[0].id}`
+      : documentType;
     if (!profilesAndDocs[profileKey][uniqueType]) {
       profilesAndDocs[profileKey][uniqueType] = [];
     }
     profilesAndDocs[profileKey][uniqueType].push(doc);
   }
+
+  const resolveDocType = (uniqueType) => {
+    if (uniqueType.startsWith('unknown_')) return 'unknown';
+    if (uniqueType.startsWith('contact_info_')) return 'contact_info';
+    return uniqueType;
+  };
 
   const isIdentityDoc = (type) => ['aadhaar', 'pan', 'passport', 'driving_licence', 'voter_id'].includes(type);
 
@@ -717,16 +923,77 @@ export async function runSyncJob(jobId, folderUrl, userId) {
     docs[idx] = { ...docs[idx], ...record };
   }
 
+  function applyParsedToPersonalDetails(profileKey, parsedData, fullName) {
+    const pd = vaultData.profiles[profileKey].personalDetails;
+    const setIf = (key, val) => {
+      if (val !== null && val !== undefined && val !== '') pd[key] = val;
+    };
+
+    const name = fullName || parsedData.name;
+    if (name && !isGenericFolderName(name)) {
+      const parts = name.split(' ').filter(Boolean);
+      setIf('firstName', parts[0] || '');
+      setIf('lastName', parts.length > 1 ? parts[parts.length - 1] : '');
+      if (parts.length > 2) {
+        setIf('middleName', parts.slice(1, -1).join(' '));
+      }
+      setIf('fullName', name);
+      setIf('name', name);
+    }
+    setIf('dob', parsedData.dob);
+    setIf('gender', parsedData.gender);
+    setIf('address', parsedData.address);
+    if (parsedData.pincode) {
+      setIf('pincode', String(parsedData.pincode).replace(/\D/g, '').slice(-6));
+    } else if (parsedData.address) {
+      const pinMatch = parsedData.address.match(/\b(\d{6})\b/);
+      if (pinMatch) setIf('pincode', pinMatch[1]);
+    }
+    setIf('email', parsedData.email);
+    if (parsedData.phone || parsedData.mobile || parsedData.phoneNumber) {
+      const phone = parsedData.phone || parsedData.mobile || parsedData.phoneNumber;
+      setIf('phone', phone);
+      setIf('phoneNumber', phone);
+    }
+    setIf('businessName', parsedData.businessName);
+    setIf('website', parsedData.website);
+    setIf('fatherName', parsedData.fatherName);
+    setIf('motherName', parsedData.motherName);
+
+    const od = parsedData.otherDetails;
+    if (od && typeof od === 'object') {
+      if (!pd.email && od.email) setIf('email', od.email);
+      if (!pd.phone && (od.phone || od.phoneNumber || od.mobile)) {
+        const phone = od.phone || od.phoneNumber || od.mobile;
+        setIf('phone', phone);
+        setIf('phoneNumber', phone);
+      }
+      if (!pd.businessName && (od.businessName || od.BusinessName || od.company)) {
+        setIf('businessName', od.businessName || od.BusinessName || od.company);
+      }
+      if (!pd.website && (od.website || od.Website || od.url)) {
+        setIf('website', od.website || od.Website || od.url);
+      }
+      if (!pd.pincode && od.pincode) setIf('pincode', String(od.pincode).replace(/\D/g, '').slice(-6));
+    }
+  }
+
   function normalizeIdentityRecord(docType, parsedData) {
     if (docType === 'aadhaar') {
+      const pincode = parsedData.pincode || (parsedData.address?.match(/\b(\d{6})\b/)?.[1] ?? null);
       return {
         idNumber: parsedData.aadhaarNumber || parsedData.idNumber || null,
+        aadhaarNumber: parsedData.aadhaarNumber || parsedData.idNumber || null,
         address: parsedData.address || null,
+        pincode,
+        fatherName: parsedData.fatherName || null,
+        motherName: parsedData.motherName || null,
         determinedDate: parsedData.determinedDate || null,
         dateSource: parsedData.dateSource || null,
         name: parsedData.name || null,
         dob: parsedData.dob || null,
         gender: parsedData.gender || null,
+        email: parsedData.email || null,
       };
     }
     if (docType === 'pan') {
@@ -756,7 +1023,7 @@ export async function runSyncJob(jobId, folderUrl, userId) {
   // Process and arbitrate identity documents per profile & type
   for (const profileKey of Object.keys(profilesAndDocs)) {
     for (const uniqueType of Object.keys(profilesAndDocs[profileKey])) {
-      const docType = uniqueType.startsWith('unknown_') ? 'unknown' : uniqueType;
+      const docType = resolveDocType(uniqueType);
       const variants = profilesAndDocs[profileKey][uniqueType];
       const bestSourceName = variants[0]?.parsedData?.name || variants[0]?.personName || '';
 
@@ -793,20 +1060,15 @@ export async function runSyncJob(jobId, folderUrl, userId) {
 
       if (isIdentityDoc(docType) && vaultData.profiles[profileKey]) {
         const { parsedData } = best;
-        if (bestSourceName) {
-          const parts = bestSourceName.split(' ');
-          vaultData.profiles[profileKey].personalDetails.firstName = parts[0] || '';
-          vaultData.profiles[profileKey].personalDetails.lastName = parts[parts.length - 1] || '';
-          vaultData.profiles[profileKey].personalDetails.fullName = bestSourceName;
-        }
-        if (parsedData.dob) vaultData.profiles[profileKey].personalDetails.dob = parsedData.dob;
-        if (parsedData.gender) vaultData.profiles[profileKey].personalDetails.gender = parsedData.gender;
+        applyParsedToPersonalDetails(profileKey, parsedData, bestSourceName);
 
         vaultData.profiles[profileKey].identities[docType] = {
           ...normalizeIdentityRecord(docType, { ...parsedData, name: bestSourceName }),
           driveFileIds: best.files.map(f => f.id),
           driveFileNames: best.files.map(f => f.name),
         };
+      } else if (vaultData.profiles[profileKey]) {
+        applyParsedToPersonalDetails(profileKey, best.parsedData, bestSourceName);
       }
 
       if (vaultData.profiles[profileKey]) {
@@ -899,13 +1161,67 @@ export async function runSyncJob(jobId, folderUrl, userId) {
     }
   }
 
-  const encryptedVault = {
-    ...vaultData,
+  // Promote identity & document fields into personalDetails when missing
+  for (const profileKey of Object.keys(vaultData.profiles)) {
+    const prof = vaultData.profiles[profileKey];
+    const pd = prof.personalDetails || (prof.personalDetails = {});
+    const aadhaar = prof.identities?.aadhaar;
+    const pan = prof.identities?.pan;
+
+    const setIf = (key, val) => {
+      if ((pd[key] === null || pd[key] === undefined || pd[key] === '') && val) pd[key] = val;
+    };
+
+    if (aadhaar) {
+      setIf('pincode', aadhaar.pincode || aadhaar.address?.match(/\b(\d{6})\b/)?.[1]);
+      setIf('address', aadhaar.address);
+      setIf('email', aadhaar.email);
+      setIf('fatherName', aadhaar.fatherName);
+      setIf('motherName', aadhaar.motherName);
+      if (!aadhaar.pincode && pd.pincode) aadhaar.pincode = pd.pincode;
+    }
+    if (pan) {
+      setIf('fatherName', pan.fatherName);
+    }
+
+    for (const doc of prof.documents || []) {
+      setIf('email', doc.email);
+      setIf('phone', doc.phone || doc.phoneNumber);
+      setIf('phoneNumber', doc.phone || doc.phoneNumber);
+      setIf('businessName', doc.businessName);
+      setIf('website', doc.website);
+      setIf('pincode', doc.pincode || doc.address?.match(/\b(\d{6})\b/)?.[1]);
+      setIf('address', doc.address);
+      setIf('fatherName', doc.fatherName);
+      setIf('motherName', doc.motherName);
+      if (!pd.middleName && doc.name) {
+        const parts = String(doc.name).split(' ').filter(Boolean);
+        if (parts.length > 2) setIf('middleName', parts.slice(1, -1).join(' '));
+      }
+      const od = doc.otherDetails;
+      if (od && typeof od === 'object') {
+        setIf('email', od.email);
+        setIf('phone', od.phone || od.phoneNumber || od.mobile);
+        setIf('phoneNumber', od.phone || od.phoneNumber || od.mobile);
+        setIf('businessName', od.businessName || od.BusinessName || od.company);
+        setIf('website', od.website || od.Website || od.url);
+        setIf('pincode', od.pincode);
+      }
+    }
+  }
+
+  const encryptedTree = {
+    ...treeCtx.tree,
+    familyTree: vaultData.familyTree,
     profiles: deepEncryptObject(vaultData.profiles),
     assets: deepEncryptObject(vaultData.assets),
+    lastSynced: new Date().toISOString(),
+    driveFolderUrl: folderUrl,
   };
 
-  await setVault(userId, encryptedVault);
+  rootVault.familyTrees[treeId] = encryptedTree;
+  rootVault.activeTreeId = treeId;
+  await setVault(userId, rootVault);
 
   console.log(`\n✅ COMPLETED - Processed: ${processed}, Failed: ${failed}`);
 
@@ -922,12 +1238,13 @@ export default async function handler(req, res) {
   const user = await verifyToken(req, res);
   if (!user) return;
 
-  const { folderUrl } = req.body;
+  const { folderUrl, treeId } = req.body;
   if (!folderUrl) return res.status(400).json({ error: 'folderUrl is required' });
+  if (!treeId) return res.status(400).json({ error: 'treeId is required. Create a family tree first.' });
 
-  const jobId = await createSyncJob({ userId: user.uid, folderUrl });
+  const jobId = await createSyncJob({ userId: user.uid, folderUrl, treeId });
 
-  runSyncJob(jobId, folderUrl, user.uid).catch(async err => {
+  runSyncJob(jobId, folderUrl, user.uid, treeId).catch(async err => {
     console.error('❌ Sync failed:', err);
     await updateSyncJob(jobId, { status: 'failed', error: err.message, finished_at: new Date().toISOString() });
   });
